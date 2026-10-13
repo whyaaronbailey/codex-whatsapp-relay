@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Named parallel relay threads within one project, independent selection and queues, and explicit project/thread targeting for work and control.
+- OpenCode v1/v2 adapters that reuse existing servers and OpenChamber conversations, with native permission handling and no duplicate backend.
+- Claude Code native CLI adapter for new/resumed sessions, bounded native session listing, structured results and interruption.
+- Multi-engine configuration, SSH worker event/control transport, and Windows launch support for existing user-scoped OpenCode authentication.
+- Local browser pairing with an in-memory QR code, verified owner-number enablement, and an idempotent login startup helper.
+
+### Changed
+
+- Project destinations now include their coding engine; Codex remains the default for existing configurations.
+- Non-Codex engines use their native permission systems. Codex sandbox settings are never silently presented as equivalent protections.
+- Legacy conversations remain the main named thread; `/threads` lists named relay threads and `/sessions` lists saved native sessions.
+
+### Fixed
+
+- Atomic controller-state saves briefly retry Windows file locks, preserve the previous state on failure, and clean up their own temporary files.
+
+Portable voice support remains deferred. Real WhatsApp pairing and installed engine/version checks are required for each deployment.
+
 ## [0.5.0] - 2026-10-13
 
 ### Added

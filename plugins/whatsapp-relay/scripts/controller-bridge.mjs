@@ -1,13 +1,12 @@
 import { randomInt } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
 
 import {
   classifyProjectIntent as classifyProjectIntentWithCodex,
   classifyVoiceCommandIntent,
   listCodexThreads,
-  normalizeVoiceCommandIntent,
   startCodexTurn
-} from "./codex-runner.mjs";
+} from "./agent-runner.mjs";
+import { normalizeVoiceCommandIntent } from "./codex-runner.mjs";
 import {
   ControllerConfigStore,
   resolvePhoneKeyFromJid
@@ -28,7 +27,7 @@ import {
   resolvePermissionLevel
 } from "./controller-permissions.mjs";
 import { drainControllerCommands } from "./controller-outbox.mjs";
-import { ControllerStateStore, defaultProjectSession } from "./controller-state.mjs";
+import { ControllerStateStore, defaultProjectSession, DEFAULT_THREAD_NAME, normalizeThreadName, projectThreadSession } from "./controller-state.mjs";
 import { normalizeHosts, resolveHost } from "./controller-hosts.mjs";
 import * as relayFiles from "./relay-files.mjs";
 import { DEFAULT_MEDIA_LIMIT, extractAttachment } from "./relay-media.mjs";
@@ -64,7 +63,9 @@ const ACTIONABLE_URL_PATTERN = /https?:\/\/\S+/i;
 export function projectBindingKey(config, project) {
   const host = resolveHost(config, project.host ?? "host");
   return JSON.stringify([host.id, host.transport, host.target ?? null, host.workerPath ?? null,
-    host.codexBin ?? config.codexBin ?? "codex", project.workspace]);
+    host.codexBin ?? config.codexBin ?? "codex", project.workspace,
+    ...(project.engine && project.engine !== "codex"
+      ? [project.engine, project.engine === "opencode" ? project.opencodeUrl ?? null : host.claudeBin ?? config.claudeBin ?? "claude"] : [])]);
 }
 
 function invalidControllerCommandError(message) {
@@ -110,7 +111,8 @@ const COMMAND_ALIASES = new Map([
   ["dfa", "permissionShortcut"],
   ["voice", "voice"],
   ["sessions", "sessions"],
-  ["threads", "sessions"],
+  ["threads", "namedThreads"],
+  ["thread", "namedThread"],
   ["ls", "sessions"],
   ["connect", "connect"],
   ["resume", "connect"],
@@ -289,7 +291,7 @@ function formatProjectStatus(project, projectSession, activeRun, permissionLevel
 
   const status = flags.length ? ` (${flags.join(", ")})` : "";
   const sessionId = shortThreadId(projectSession.threadId ?? null);
-  return `- ${project.alias}${status} session=${sessionId} perms=${permissionLevel}`;
+  return `- ${project.alias}${status} host=${project.host ?? "host"} engine=${project.engine ?? "codex"} session=${sessionId} perms=${permissionLevel}`;
 }
 
 function formatProjectShortcut(index) {
@@ -342,16 +344,21 @@ function helpText() {
     "/host <id> [project] -> select a machine (and optionally its project)",
     "/files -> list stored attachments in the active machine/project",
     "/send <relative file path> -> send a file from the active workspace",
-    "Send a document, image, or video to save it in the active workspace; add a caption to ask Codex about it.",
+    "Send a document, image, or video to save it in the active workspace; add a caption to ask the selected coding tool about it.",
     "/projects -> list configured projects",
+    "/threads -> list named relay sessions in the active project",
+    "/thread <name> -> select or create a named session (main is the original session)",
+    "/in <project>/<name> <prompt> -> run in a named session without switching",
+    "/status, /stop, /approve, /deny, /sessions and /session also accept project/name targets.",
+    "Named sessions can run concurrently in the same workspace. Their file edits can conflict; no worktree is created automatically.",
     "/project -> show the active project for this chat",
     "/project <number|alias|project hint|path hint> -> switch this chat to another project, letting Codex resolve natural project hints against existing projects before auto-adding a repo from a path",
     "/status or /st [project] -> show the current project session or another project's session",
     "/new or /n [prompt] -> start a fresh session in the active project, optionally with a first prompt",
     "/in <project> <prompt> -> send a one-off prompt to another project without switching",
     "/btw <prompt> -> ask a disposable side question and then return to your current project",
-    "/sessions or /ls [project] -> list recent Codex threads for a project with /1, /2, ... shortcuts",
-    "/session [project] <n|thread-id-prefix>, /connect <...>, /c <...>, or /1 -> switch this chat to another Codex thread inside a project",
+    "/sessions or /ls [project] -> list recent native sessions for a project with /1, /2, ... shortcuts",
+    "/session [project] <n|thread-id-prefix>, /connect <...>, /c <...>, or /1 -> attach a native session to the selected relay thread",
     "/permissions or /p [project] [ro|ww|dfa] -> inspect or change read-only, workspace-write, or danger-full-access",
     "/ro, /ww, /dfa -> quick permission switch for the active project",
     "/voice [status|on|off] [1x|2x] -> inspect or change voice reply mode for this chat",
@@ -361,8 +368,8 @@ function helpText() {
     "/stop or /x [project|btw] -> stop an in-flight Codex run",
     "/help or /h -> show this help",
     "",
-    "Any other text in this direct chat continues the active project's current Codex session.",
-    "If that same project or /btw scope is already busy, prompt-like follow-ups queue automatically and run in order.",
+    "Any other text in this direct chat continues the selected named session in the active project.",
+    "If that same named session or /btw scope is already busy, prompt-like follow-ups queue automatically and run in order.",
     `Voice notes are transcribed locally with ${DEFAULT_TRANSCRIPTION_MODEL}.`,
     "Short spoken commands are supported for help, status, stop, and new session.",
     "Say or type 'start new session in alpha app inside code directory' to jump into another repo without manually adding it first.",
@@ -641,6 +648,9 @@ export function parseIncomingCommand(text, captureAllDirectMessages) {
     const normalizedCommand = COMMAND_ALIASES.get(command) ?? null;
 
     switch (normalizedCommand) {
+      case "namedThreads":
+      case "namedThread":
+        return { type: normalizedCommand, payload };
       case "hosts":
       case "files":
         return { type: normalizedCommand };
@@ -938,6 +948,7 @@ function shouldRetryVoiceTranscript(transcription) {
 function resolveSessionPermissionLevel(config, projectOrSession = {}, maybeSession = undefined) {
   const project = maybeSession === undefined ? null : projectOrSession;
   const session = maybeSession === undefined ? projectOrSession : maybeSession;
+  if (project?.engine === "opencode" || project?.engine === "claude") return "native";
   return resolvePermissionLevel(
     session.permissionLevel ??
       project?.permissionLevel ??
@@ -1127,8 +1138,15 @@ export function resolveProjectSelection(projects, token) {
   };
 }
 
-function projectRunKey(phoneKey, projectAlias) {
-  return `project:${phoneKey}:${projectAlias}`;
+function projectRunKey(phoneKey, projectAlias, threadName = DEFAULT_THREAD_NAME) {
+  return `project:${phoneKey}:${projectAlias}${threadName === DEFAULT_THREAD_NAME ? "" : `:${threadName}`}`;
+}
+
+function parseNamedTarget(token) {
+  const match = String(token ?? "").match(/^([^/]+)\/([^/]+)$/);
+  if (!match) return null;
+  const threadName = normalizeThreadName(match[2]);
+  return threadName ? { projectToken: match[1], threadName } : null;
 }
 
 function btwRunKey(phoneKey) {
@@ -1146,6 +1164,14 @@ function parseProjectPromptPayload(payload, config) {
   const tokens = splitPayloadTokens(payload);
   if (tokens.length < 2) {
     return null;
+  }
+
+  const named = parseNamedTarget(tokens[0]);
+  if (named) {
+    const selection = resolveConfiguredProjectSelection(config, named.projectToken);
+    return { projectToken: named.projectToken, project: selection.match,
+      candidates: selection.match ? [] : selection.candidates, threadName: named.threadName,
+      prompt: tokens.slice(1).join(" ") };
   }
 
   let ambiguousSelection = null;
@@ -1196,7 +1222,7 @@ export function parseApprovalTargetPayload(payload, baseDecision) {
   const targetTokens = [];
 
   for (const token of splitPayloadTokens(payload)) {
-    if (token.toLowerCase() === "session") {
+    if (token.toLowerCase() === "session" && baseDecision === "accept") {
       decision = "acceptForSession";
       continue;
     }
@@ -1211,6 +1237,13 @@ export function parseApprovalTargetPayload(payload, baseDecision) {
 
 function parseConnectPayload(payload, config) {
   const tokens = splitPayloadTokens(payload);
+  const named = parseNamedTarget(tokens[0]);
+  if (named && tokens.length >= 2) {
+    const selection = resolveConfiguredProjectSelection(config, named.projectToken);
+    return { projectAlias: selection.match?.alias ?? null, threadName: named.threadName,
+      selector: tokens.slice(1).join(" "), ambiguousProjects: selection.match ? [] : selection.candidates,
+      ambiguousProjectToken: named.projectToken, invalidTarget: !selection.match };
+  }
   if (tokens.length >= 2) {
     let ambiguousSelection = null;
     for (let prefixLength = tokens.length - 1; prefixLength >= 1; prefixLength -= 1) {
@@ -1267,10 +1300,12 @@ function parseProjectTargetPayload(payload, config) {
     };
   }
 
-  const selection = resolveConfiguredProjectSelection(config, token);
+  const named = parseNamedTarget(token);
+  const selection = resolveConfiguredProjectSelection(config, named?.projectToken ?? token);
   return selection.match
     ? {
         projectAlias: selection.match.alias,
+        threadName: named?.threadName ?? null,
         targetType: "project"
       }
     : selection.candidates.length
@@ -1315,11 +1350,13 @@ function parsePermissionsPayload(payload, config) {
   };
 
   if (tokens.length >= 2) {
-    const selection = resolveConfiguredProjectSelection(config, tokens[0]);
+    const named = parseNamedTarget(tokens[0]);
+    const selection = resolveConfiguredProjectSelection(config, named?.projectToken ?? tokens[0]);
     if (selection.match) {
       const extracted = extractPermissionToken(tokens.slice(1));
       return {
         projectAlias: selection.match.alias,
+        threadName: named?.threadName ?? null,
         permissionToken: extracted.permissionToken,
         confirmationToken: extracted.confirmationToken,
         ambiguousProjects: []
@@ -1349,11 +1386,16 @@ function parsePermissionsPayload(payload, config) {
 
 function formatDangerFullAccessConfirmationCommand({
   projectAlias,
+  threadName = null,
   confirmationCode,
   activeProjectAlias
 }) {
   const commandTokens = ["/dfa"];
-  if (projectAlias !== activeProjectAlias) {
+  // A confirmation code belongs to a specific slot. Qualify the target even
+  // when currently selected, because selection can change before the reply.
+  if (threadName) {
+    commandTokens.push(`${projectAlias}/${threadName}`);
+  } else if (projectAlias !== activeProjectAlias) {
     commandTokens.push(projectAlias);
   }
 
@@ -1363,12 +1405,14 @@ function formatDangerFullAccessConfirmationCommand({
 
 export function buildDangerFullAccessConfirmationMessage({
   projectAlias,
+  threadName = null,
   confirmationCode,
   activeProjectAlias,
   windowMs = DANGER_CONFIRMATION_WINDOW_MS
 }) {
   const confirmationCommand = formatDangerFullAccessConfirmationCommand({
     projectAlias,
+    threadName,
     confirmationCode,
     activeProjectAlias
   });
@@ -1376,7 +1420,7 @@ export function buildDangerFullAccessConfirmationMessage({
   const windowLabel = minutes === 1 ? "1 minute" : `${minutes} minutes`;
 
   return [
-    `Danger full access for ${projectAlias} disables sandboxing and approval prompts.`,
+    `Danger full access for ${projectAlias}${threadName ? `/${threadName}` : ""} disables sandboxing and approval prompts.`,
     `Reply ${confirmationCommand} within ${windowLabel}.`
   ].join("\n");
 }
@@ -1424,17 +1468,75 @@ export class WhatsAppControllerBridge {
     return resolveConfiguredProject(this.configStore.data, chatSession.activeProject);
   }
 
-  getProjectSession(phoneKey, projectAlias = null) {
+  runnerOptions(project) {
+    const config = this.configStore.data;
+    const host = resolveHost(config, project.host ?? "host");
+    const codex = !project.engine || project.engine === "codex";
+    return { ...project, host, codexBin: config.codexBin,
+      claudeBin: host.claudeBin ?? config.claudeBin,
+      model: project.model ?? (codex ? config.model : null),
+      profile: project.profile ?? (codex ? config.profile : null),
+      search: project.search ?? (codex ? config.search : false) };
+  }
+
+  sessionScopeLabel(phoneKey, project = this.getActiveProject(phoneKey), threadName = null) {
+    const selected = this.getProjectSession(phoneKey, project.alias, threadName).threadName;
+    return `${project.host ?? "host"}/${project.engine ?? "codex"}/${project.alias}/${selected}`;
+  }
+
+  nativeThreadBusy(project, nativeThreadId, exceptKey = null) {
+    if (!nativeThreadId) return false;
+    const bindingKey = projectBindingKey(this.configStore.data, project);
+    return [...this.activeRuns.entries()].some(([key, run]) => key !== exceptKey &&
+      run.bindingKey === bindingKey && run.threadId === nativeThreadId);
+  }
+
+  async handleNamedThreadCommand({ phoneKey, remoteJid, payload = "" }) {
+    const project = this.getActiveProject(phoneKey);
+    if (!payload.trim()) return this.sendNamedThreadList(phoneKey, remoteJid);
+    const threadName = normalizeThreadName(payload);
+    if (!threadName) {
+      await this.sendReply(remoteJid, "Usage: /thread <name>. Use 1–48 letters, numbers, hyphens or underscores.");
+      return;
+    }
+    await this.stateStore.mutateSession(phoneKey, (chat) => {
+      const projectState = chat.projects[project.alias] ??= defaultProjectSession();
+      projectThreadSession(projectState, threadName, true);
+      projectState.activeThread = threadName;
+    });
+    await this.sendReply(remoteJid, `Selected ${project.host ?? "host"}/${project.engine ?? "codex"}/${project.alias}/${threadName}. Send a message to start or continue it. Other named sessions keep running. Sessions share this workspace, so their file edits can conflict.`);
+  }
+
+  async sendNamedThreadList(phoneKey, remoteJid) {
+    const project = this.getActiveProject(phoneKey);
+    const state = this.getChatSession(phoneKey).projects[project.alias] ?? defaultProjectSession();
+    const selected = state.activeThread ?? DEFAULT_THREAD_NAME;
+    const lines = [
+      `Named relay sessions for ${project.host ?? "host"}/${project.engine ?? "codex"}/${project.alias}:`,
+      ...[DEFAULT_THREAD_NAME, ...Object.keys(state.namedThreads ?? {})].map((name) => {
+        const slot = projectThreadSession(state, name);
+        const run = this.projectRun(phoneKey, project.alias, name);
+        return `${name === selected ? "* " : ""}${name}: ${run ? "running" : "idle"}; native=${shortThreadId(slot.threadId)}; queued=${slot.queuedPrompts?.length ?? 0}`;
+      }),
+      "Use /thread <name> to select/create one; /sessions lists native sessions to attach to the selected slot.",
+      "Named sessions share the project workspace; concurrent file edits can conflict."
+    ];
+    await this.sendReply(remoteJid, lines.join("\n"));
+  }
+
+  getProjectSession(phoneKey, projectAlias = null, threadName = null) {
     const chatSession = this.getChatSession(phoneKey);
     const resolvedProject =
       projectAlias !== null
         ? resolveConfiguredProject(this.configStore.data, projectAlias)
         : this.getActiveProject(phoneKey);
+    const projectState = chatSession.projects?.[resolvedProject.alias] ?? defaultProjectSession();
+    const selectedThread = normalizeThreadName(threadName ?? projectState.activeThread) ?? DEFAULT_THREAD_NAME;
     return {
       chatSession,
       project: resolvedProject,
-      session:
-        chatSession.projects?.[resolvedProject.alias] ?? defaultProjectSession()
+      threadName: selectedThread,
+      session: projectThreadSession(projectState, selectedThread)
     };
   }
 
@@ -1445,27 +1547,29 @@ export class WhatsAppControllerBridge {
     });
   }
 
-  async upsertProjectSession(phoneKey, projectAlias, { chatPatch = {}, projectPatch = {}, guard = null } = {}) {
+  async upsertProjectSession(phoneKey, projectAlias, { chatPatch = {}, projectPatch = {}, guard = null, threadName = null } = {}) {
+    const selectedThread = this.getProjectSession(phoneKey, projectAlias, threadName).threadName;
     return this.stateStore.mutateSession(phoneKey, (current) => {
-      if (guard && !guard(current.projects?.[projectAlias])) return false;
+      const projectState = current.projects[projectAlias] ??= defaultProjectSession();
+      const slot = projectThreadSession(projectState, selectedThread, true);
+      if (guard && !guard(slot)) return false;
       Object.assign(current, chatPatch, { phoneKey });
-      current.projects[projectAlias] = {
-        ...(current.projects[projectAlias] ?? defaultProjectSession()),
-        ...projectPatch
-      };
+      Object.assign(slot, projectPatch);
       return true;
     });
   }
 
-  async resetProjectSession(phoneKey, projectAlias, chatPatch = {}) {
+  async resetProjectSession(phoneKey, projectAlias, chatPatch = {}, threadName = null) {
     await this.upsertProjectSession(phoneKey, projectAlias, {
       chatPatch,
+      threadName,
       projectPatch: defaultProjectSession()
     });
   }
 
-  projectRun(phoneKey, projectAlias) {
-    return this.activeRuns.get(projectRunKey(phoneKey, projectAlias));
+  projectRun(phoneKey, projectAlias, threadName = null) {
+    const selectedThread = this.getProjectSession(phoneKey, projectAlias, threadName).threadName;
+    return this.activeRuns.get(projectRunKey(phoneKey, projectAlias, selectedThread));
   }
 
   btwRun(phoneKey) {
@@ -1473,18 +1577,9 @@ export class WhatsAppControllerBridge {
   }
 
   activeProjectRuns(phoneKey) {
-    const chatSession = this.getChatSession(phoneKey);
-    return Object.keys(chatSession.projects ?? {})
-      .map((projectAlias) => {
-        const run = this.projectRun(phoneKey, projectAlias);
-        return run
-          ? {
-              projectAlias,
-              run
-            }
-          : null;
-      })
-      .filter(Boolean);
+    return [...this.activeRuns.entries()]
+      .filter(([key]) => key.startsWith(`project:${phoneKey}:`))
+      .map(([, run]) => ({ projectAlias: run.projectAlias, threadName: run.threadName ?? DEFAULT_THREAD_NAME, run }));
   }
 
   updateActiveRunVoiceReplySettings(phoneKey, voiceReply) {
@@ -1505,7 +1600,7 @@ export class WhatsAppControllerBridge {
     return updatedRuns;
   }
 
-  getQueuedPrompts(phoneKey, { scopeType = "project", projectAlias = null } = {}) {
+  getQueuedPrompts(phoneKey, { scopeType = "project", projectAlias = null, threadName = null } = {}) {
     const chatSession = this.getChatSession(phoneKey);
     if (scopeType === "btw") {
       return [...(chatSession.btw?.queuedPrompts ?? [])];
@@ -1515,7 +1610,7 @@ export class WhatsAppControllerBridge {
       ? normalizeConfiguredProjects(this.configStore.data).projects.find((item) => item.alias === projectAlias)
       : this.getActiveProject(phoneKey);
     if (!project) return [];
-    return [...(chatSession.projects?.[project.alias]?.queuedPrompts ?? [])];
+    return [...(this.getProjectSession(phoneKey, project.alias, threadName).session.queuedPrompts ?? [])];
   }
 
   queuedPromptCount(phoneKey, options = {}) {
@@ -1523,7 +1618,7 @@ export class WhatsAppControllerBridge {
   }
 
   async enqueueQueuedPrompt({
-    phoneKey, remoteJid, label, scopeType = "project", projectAlias = null,
+    phoneKey, remoteJid, label, scopeType = "project", projectAlias = null, threadName = null,
     prompt, forceNewThread = false, voiceReplyOverride = null, expectedBindingKey = null
   }) {
     const trimmedPrompt = String(prompt ?? "").trim();
@@ -1532,10 +1627,11 @@ export class WhatsAppControllerBridge {
       ? this.configStore.data.projects.find((project) => project.alias === projectAlias)
       : this.getActiveProject(phoneKey);
     if (!queuedProject) return 0;
+    threadName = this.getProjectSession(phoneKey, queuedProject.alias, threadName).threadName;
     const bindingKey = projectBindingKey(this.configStore.data, queuedProject);
     if (expectedBindingKey && expectedBindingKey !== bindingKey) return 0;
     const queuedPrompt = {
-      prompt: trimmedPrompt, projectAlias: queuedProject.alias, bindingKey,
+      prompt: trimmedPrompt, projectAlias: queuedProject.alias, bindingKey, threadName,
       forceNewThread, queuedAt: new Date().toISOString(),
       voiceReplyOverride: voiceReplyOverride?.enabled
         ? { enabled: true, speed: voiceReplyOverride.speed ?? null } : null
@@ -1545,25 +1641,27 @@ export class WhatsAppControllerBridge {
       if (!currentProject || projectBindingKey(this.configStore.data, currentProject) !== bindingKey) return 0;
       Object.assign(session, { phoneKey, remoteJid, label });
       const bucket = scopeType === "btw" ? session.btw
-        : (session.projects[queuedProject.alias] ??= defaultProjectSession());
+        : projectThreadSession(session.projects[queuedProject.alias] ??= defaultProjectSession(), threadName, true);
       bucket.queuedPrompts.push(queuedPrompt);
       if (scopeType === "btw") bucket.lastUsedAt = new Date().toISOString();
       return bucket.queuedPrompts.length;
     });
   }
 
-  async dequeueQueuedPrompt(phoneKey, { scopeType = "project", projectAlias = null } = {}) {
+  async dequeueQueuedPrompt(phoneKey, { scopeType = "project", projectAlias = null, threadName = null } = {}) {
     const alias = projectAlias ?? this.getActiveProject(phoneKey).alias;
+    threadName = this.getProjectSession(phoneKey, alias, threadName).threadName;
     return this.stateStore.mutateSession(phoneKey, (session) => {
-      const bucket = scopeType === "btw" ? session.btw : session.projects[alias];
+      const bucket = scopeType === "btw" ? session.btw : projectThreadSession(session.projects[alias], threadName);
       return bucket?.queuedPrompts.shift() ?? null;
     });
   }
 
-  async clearQueuedPrompts(phoneKey, { scopeType = "project", projectAlias = null } = {}) {
+  async clearQueuedPrompts(phoneKey, { scopeType = "project", projectAlias = null, threadName = null } = {}) {
     const alias = projectAlias ?? this.getActiveProject(phoneKey).alias;
+    threadName = this.getProjectSession(phoneKey, alias, threadName).threadName;
     return this.stateStore.mutateSession(phoneKey, (session) => {
-      const bucket = scopeType === "btw" ? session.btw : session.projects[alias];
+      const bucket = scopeType === "btw" ? session.btw : projectThreadSession(session.projects[alias], threadName);
       const count = bucket?.queuedPrompts.length ?? 0;
       if (bucket) bucket.queuedPrompts = [];
       return count;
@@ -1576,6 +1674,7 @@ export class WhatsAppControllerBridge {
     label,
     scopeType = "project",
     projectAlias = null,
+    threadName = null,
     prompt,
     forceNewThread = false,
     voiceReplyOverride = null,
@@ -1589,10 +1688,11 @@ export class WhatsAppControllerBridge {
       await this.sendReply(remoteJid, "The selected project is no longer configured. Use /projects to select a destination.");
       return true;
     }
+    threadName = this.getProjectSession(phoneKey, project.alias, threadName).threadName;
     const activeRun =
       scopeType === "btw"
         ? this.btwRun(phoneKey)
-        : this.projectRun(phoneKey, project.alias);
+        : this.projectRun(phoneKey, project.alias, threadName);
     if (expectedBindingKey && expectedBindingKey !== projectBindingKey(this.configStore.data, project)) {
       await this.sendReply(remoteJid, "The attachment destination changed during download. Its caption was not sent; select the intended project and resend your request.");
       return true;
@@ -1601,7 +1701,7 @@ export class WhatsAppControllerBridge {
       await this.sendReply(remoteJid, "The current run is stopping. Send the follow-up again after it stops.");
       return true;
     }
-    const runKey = scopeType === "btw" ? btwRunKey(phoneKey) : projectRunKey(phoneKey, project.alias);
+    const runKey = scopeType === "btw" ? btwRunKey(phoneKey) : projectRunKey(phoneKey, project.alias, threadName);
     if (!activeRun && !this.queueDrains.has(runKey)) {
       return false;
     }
@@ -1612,6 +1712,7 @@ export class WhatsAppControllerBridge {
       label,
       scopeType,
       projectAlias: project.alias,
+      threadName,
       prompt,
       forceNewThread,
       voiceReplyOverride,
@@ -1627,7 +1728,7 @@ export class WhatsAppControllerBridge {
         statusPrelude,
         scopeType === "btw"
           ? "Queued your next btw message. I will read it as soon as the current task finishes."
-          : `Queued your next message for project ${project.alias}. I will read it as soon as the current task finishes.`,
+          : `Queued your next message for project ${project.alias}/${threadName}. I will read it as soon as the current task finishes.`,
         activeRun?.pendingApproval
           ? "The current run is still waiting on approval."
           : null,
@@ -1642,17 +1743,20 @@ export class WhatsAppControllerBridge {
     remoteJid,
     label,
     scopeType = "project",
-    projectAlias = null
+    projectAlias = null,
+    threadName = null
   }) {
     const alias = projectAlias ?? this.getActiveProject(phoneKey).alias;
-    const runKey = scopeType === "btw" ? btwRunKey(phoneKey) : projectRunKey(phoneKey, alias);
+    threadName = this.getProjectSession(phoneKey, alias, threadName).threadName;
+    const runKey = scopeType === "btw" ? btwRunKey(phoneKey) : projectRunKey(phoneKey, alias, threadName);
     if (this.queueDrains.has(runKey) || this.activeRuns.has(runKey)) return false;
     this.queueDrains.add(runKey);
     let queuedPrompt;
     try {
       queuedPrompt = await this.dequeueQueuedPrompt(phoneKey, {
       scopeType,
-      projectAlias: alias
+      projectAlias: alias,
+      threadName
       });
     } finally {
       this.queueDrains.delete(runKey);
@@ -1669,6 +1773,7 @@ export class WhatsAppControllerBridge {
       label,
       scopeType,
       projectAlias: queuedPrompt.projectAlias ?? alias,
+      threadName: queuedPrompt.threadName ?? threadName,
       expectedBindingKey: queuedPrompt.bindingKey,
       voiceReplyOverride: queuedPrompt.voiceReplyOverride ?? null,
       statusPrelude:
@@ -1851,12 +1956,18 @@ export class WhatsAppControllerBridge {
     }
 
     for (const [runKey, run] of this.activeRuns.entries()) {
-      await run.interrupt().catch(() => {
-        if (!run.child.killed) {
-          run.child.kill("SIGTERM");
-        }
-      });
-      this.activeRuns.delete(runKey);
+      run.cancelled = true;
+      run.stopping = true;
+      try {
+        await run.interrupt();
+        this.activeRuns.delete(runKey);
+      } catch {
+        run.stopUnconfirmed = true;
+        run.status = "stop-unconfirmed";
+        if (run.child && !run.child.killed) run.child.kill?.("SIGTERM");
+        // A detached HTTP session can outlive the relay. Keep its runtime guard
+        // until the provider reports a terminal result; never resume its queue.
+      }
     }
 
     if (clearProcess) {
@@ -1909,13 +2020,14 @@ export class WhatsAppControllerBridge {
   summary() {
     const sessions = this.stateStore.listSessions().map((session) => {
       const activeProjectAlias = session.activeProject ?? this.configStore.data.defaultProject;
-      const activeProjectSession =
-        session.projects?.[activeProjectAlias] ?? defaultProjectSession();
+      const activeProjectState = session.projects?.[activeProjectAlias] ?? defaultProjectSession();
+      const activeProjectSession = projectThreadSession(activeProjectState);
       const activeRun = this.projectRun(session.phoneKey, activeProjectAlias);
       return {
         phoneKey: session.phoneKey,
         label: session.label ?? null,
         activeProject: activeProjectAlias,
+        activeThread: activeProjectState.activeThread ?? DEFAULT_THREAD_NAME,
         threadId: activeProjectSession.threadId ?? null,
         busy:
           this.activeProjectRuns(session.phoneKey).length > 0 ||
@@ -1925,10 +2037,18 @@ export class WhatsAppControllerBridge {
         runLastEventAt: activeRun?.lastEventAt ?? null,
         permissionLevel:
           activeProjectSession.permissionLevel ?? this.configStore.data.permissionLevel,
-        projects: Object.entries(session.projects ?? {}).map(([alias, projectSession]) => {
+        projects: Object.entries(session.projects ?? {}).map(([alias, projectState]) => {
+          const projectSession = projectThreadSession(projectState);
           const run = this.projectRun(session.phoneKey, alias);
           return {
             alias,
+            activeThread: projectState.activeThread ?? DEFAULT_THREAD_NAME,
+            threads: [DEFAULT_THREAD_NAME, ...Object.keys(projectState.namedThreads ?? {})].map((name) => {
+              const slot = projectThreadSession(projectState, name);
+              const active = this.projectRun(session.phoneKey, alias, name);
+              return { name, threadId: slot.threadId ?? null, busy: Boolean(active),
+                runStatus: active?.status ?? null, queuedMessages: slot.queuedPrompts?.length ?? 0 };
+            }),
             threadId: projectSession.threadId ?? null,
             busy: Boolean(run),
             runStatus: run?.status ?? null,
@@ -2089,6 +2209,7 @@ export class WhatsAppControllerBridge {
       config,
       chatSession.activeProject ?? config.defaultProject
     );
+    const inboundThreadName = this.getProjectSession(phoneKey, activeProject.alias).threadName;
     const inboundBindingKey = projectBindingKey(config, activeProject);
     const label = controller.label ?? message.pushName ?? null;
 
@@ -2105,7 +2226,7 @@ export class WhatsAppControllerBridge {
 
     const attachment = extractAttachment(message.message);
     if (attachment) {
-      await this.handleAttachmentMessage({ message, attachment, phoneKey, remoteJid, label, project: activeProject });
+      await this.handleAttachmentMessage({ message, attachment, phoneKey, remoteJid, label, project: activeProject, threadName: inboundThreadName });
       return;
     }
 
@@ -2238,6 +2359,12 @@ export class WhatsAppControllerBridge {
     }
 
     switch (command.type) {
+      case "namedThreads":
+        await this.sendNamedThreadList(phoneKey, remoteJid);
+        return;
+      case "namedThread":
+        await this.handleNamedThreadCommand({ phoneKey, remoteJid, payload: command.payload });
+        return;
       case "hosts":
         await this.sendReply(remoteJid, this.renderHostList(phoneKey));
         return;
@@ -2289,7 +2416,7 @@ export class WhatsAppControllerBridge {
         return;
       case "new":
         {
-          const activeRun = this.projectRun(phoneKey, activeProject.alias);
+          const activeRun = this.projectRun(phoneKey, activeProject.alias, inboundThreadName);
           if (activeRun) {
             if (command.prompt) {
               await this.queuePromptIfBusy({
@@ -2298,6 +2425,7 @@ export class WhatsAppControllerBridge {
                 label,
                 scopeType: "project",
                 projectAlias: activeProject.alias,
+            threadName: inboundThreadName,
             expectedBindingKey: inboundBindingKey,
                 prompt: command.prompt,
                 forceNewThread: true,
@@ -2317,7 +2445,7 @@ export class WhatsAppControllerBridge {
             remoteJid,
             label,
             activeProject: activeProject.alias
-          });
+          }, inboundThreadName);
         }
         if (command.prompt) {
           await this.runPrompt({
@@ -2328,6 +2456,7 @@ export class WhatsAppControllerBridge {
             label,
             scopeType: "project",
             projectAlias: activeProject.alias,
+            threadName: inboundThreadName,
             expectedBindingKey: inboundBindingKey,
             voiceReplyOverride: command.voiceReply ?? null,
             statusPrelude: voiceTranscriptReply
@@ -2375,6 +2504,7 @@ export class WhatsAppControllerBridge {
             return;
           }
 
+          const targetThreadName = this.getProjectSession(phoneKey, targetProject.alias, parsed.threadName).threadName;
           if (
             await this.queuePromptIfBusy({
               phoneKey,
@@ -2382,6 +2512,7 @@ export class WhatsAppControllerBridge {
               label,
               scopeType: "project",
               projectAlias: targetProject.alias,
+              threadName: targetThreadName,
               expectedBindingKey: projectBindingKey(config, targetProject),
               prompt: parsed.prompt,
               forceNewThread: false,
@@ -2400,6 +2531,7 @@ export class WhatsAppControllerBridge {
             label,
             scopeType: "project",
             projectAlias: targetProject.alias,
+              threadName: targetThreadName,
               expectedBindingKey: projectBindingKey(config, targetProject),
             voiceReplyOverride: command.voiceReply ?? null,
             statusPrelude: voiceTranscriptReply
@@ -2414,6 +2546,7 @@ export class WhatsAppControllerBridge {
             label,
             scopeType: "btw",
             projectAlias: activeProject.alias,
+            threadName: inboundThreadName,
             expectedBindingKey: inboundBindingKey,
             prompt: command.prompt,
             forceNewThread: true,
@@ -2431,6 +2564,7 @@ export class WhatsAppControllerBridge {
           label,
           scopeType: "btw",
           projectAlias: activeProject.alias,
+            threadName: inboundThreadName,
             expectedBindingKey: inboundBindingKey,
           voiceReplyOverride: command.voiceReply ?? null,
           statusPrelude: voiceTranscriptReply
@@ -2466,6 +2600,7 @@ export class WhatsAppControllerBridge {
             label,
             scopeType: "project",
             projectAlias: activeProject.alias,
+            threadName: inboundThreadName,
             expectedBindingKey: inboundBindingKey,
             prompt: command.prompt,
             forceNewThread: false,
@@ -2483,6 +2618,7 @@ export class WhatsAppControllerBridge {
           label,
           scopeType: "project",
           projectAlias: activeProject.alias,
+            threadName: inboundThreadName,
             expectedBindingKey: inboundBindingKey,
           voiceReplyOverride: command.voiceReply ?? null,
           statusPrelude: voiceTranscriptReply
@@ -2534,7 +2670,8 @@ export class WhatsAppControllerBridge {
     };
   }
 
-  async handleAttachmentMessage({ message, attachment, phoneKey, remoteJid, label, project }) {
+  async handleAttachmentMessage({ message, attachment, phoneKey, remoteJid, label, project, threadName = null }) {
+    threadName = this.getProjectSession(phoneKey, project.alias, threadName).threadName;
     const expectedBindingKey = projectBindingKey(this.configStore.data, project);
     try {
       const options = this.fileOptions(project);
@@ -2551,7 +2688,7 @@ export class WhatsAppControllerBridge {
         `Media type: ${JSON.stringify(saved.mimetype)}`,
         "User request:", attachment.caption
       ].join("\n");
-      const request = { phoneKey, remoteJid, label, scopeType: "project", projectAlias: project.alias, prompt, forceNewThread: false, expectedBindingKey };
+      const request = { phoneKey, remoteJid, label, scopeType: "project", projectAlias: project.alias, threadName, prompt, forceNewThread: false, expectedBindingKey };
       if (!(await this.queuePromptIfBusy(request))) await this.runPrompt(request);
     } catch (error) {
       await this.sendReply(remoteJid, `Attachment handling failed on ${project.host ?? "host"} / ${project.alias}: ${error.message}`);
@@ -2605,7 +2742,7 @@ export class WhatsAppControllerBridge {
       "Projects:",
       "",
       ...config.projects.flatMap((project, index) => {
-        const projectSession = chatSession.projects?.[project.alias] ?? defaultProjectSession();
+        const projectSession = this.getProjectSession(phoneKey, project.alias).session;
         const run = this.projectRun(phoneKey, project.alias);
         const permissionLevel = resolveSessionPermissionLevel(
           config,
@@ -2779,27 +2916,28 @@ export class WhatsAppControllerBridge {
     }
 
     const project = resolveConfiguredProject(config, target.projectAlias ?? activeProject.alias);
-    const projectSession = chatSession.projects?.[project.alias] ?? defaultProjectSession();
-    const activeRun = this.projectRun(phoneKey, project.alias);
+    const { session: projectSession, threadName } = this.getProjectSession(phoneKey, project.alias, target.threadName);
+    const activeRun = this.projectRun(phoneKey, project.alias, threadName);
     const permissionLevel = resolveSessionPermissionLevel(config, project, projectSession);
     const pendingConfirmation =
       isConfirmationFresh(projectSession) && projectSession.pendingPermissionConfirmation
         ? projectSession.pendingPermissionConfirmation
         : null;
-    const busyProjects = Object.keys(chatSession.projects ?? {}).filter((alias) =>
-      Boolean(this.projectRun(phoneKey, alias))
-    );
+    const busyProjects = this.activeProjectRuns(phoneKey).map((item) => `${item.projectAlias}/${item.threadName}`);
 
     return [
       "WhatsApp Codex bridge",
       `active_project: ${activeProject.alias}`,
       `project: ${project.alias}`,
       `host: ${project.host ?? "host"}`,
+      `engine: ${project.engine ?? "codex"}`,
+      `relay_thread: ${threadName}`,
       `session: ${shortThreadId(projectSession.threadId ?? null)}`,
       `busy: ${activeRun ? "yes" : "no"}`,
       `queued_messages: ${this.queuedPromptCount(phoneKey, {
         scopeType: "project",
-        projectAlias: project.alias
+        projectAlias: project.alias,
+        threadName
       })}`,
       `permissions: ${permissionLevel}`,
       `voice_reply: ${formatVoiceReplySummary(voiceReply)}`,
@@ -2843,23 +2981,21 @@ export class WhatsAppControllerBridge {
       config,
       target.projectAlias ?? this.getActiveProject(phoneKey).alias
     );
-    const { session } = this.getProjectSession(phoneKey, project.alias);
+    const { session, threadName } = this.getProjectSession(phoneKey, project.alias, target.threadName);
     const threads = await this.runner.listCodexThreads({
-      codexBin: config.codexBin,
+      ...this.runnerOptions(project),
       host: resolveHost(config, project.host ?? "host"),
       workspace: project.workspace,
-      model: project.model ?? config.model,
-      profile: project.profile ?? config.profile,
-      search: project.search ?? config.search,
       limit: SESSION_LIST_LIMIT
     });
 
     if (!threads.length) {
-      await this.sendReply(remoteJid, "No Codex threads were found.");
+      await this.sendReply(remoteJid, "No native sessions were found.");
       return;
     }
 
     await this.upsertProjectSession(phoneKey, project.alias, {
+      threadName,
       projectPatch: {
         lastThreadChoices: threads.map((thread) => ({
           id: thread.id,
@@ -2872,7 +3008,7 @@ export class WhatsAppControllerBridge {
     });
 
     const lines = [
-      `Recent Codex sessions for ${project.alias} on ${project.host ?? "host"}:`,
+      `Recent ${project.engine ?? "codex"} sessions for ${project.alias}/${threadName} on ${project.host ?? "host"}:`,
       "",
       ...threads.map((thread, index) =>
         summarizeThreadChoice(thread, session.threadId ?? null, index + 1)
@@ -2887,6 +3023,10 @@ export class WhatsAppControllerBridge {
   async connectToThread({ phoneKey, remoteJid, payload, label }) {
     const config = this.configStore.data;
     const parsed = parseConnectPayload(payload, config);
+    if (parsed.invalidTarget && !parsed.ambiguousProjects?.length) {
+      await this.sendReply(remoteJid, "Unknown project/thread target. Use /projects and /threads to inspect destinations.");
+      return;
+    }
     if (parsed.ambiguousProjects?.length) {
       await this.sendReply(
         remoteJid,
@@ -2902,8 +3042,9 @@ export class WhatsAppControllerBridge {
       config,
       parsed.projectAlias ?? this.getActiveProject(phoneKey).alias
     );
+    const threadName = this.getProjectSession(phoneKey, project.alias, parsed.threadName).threadName;
     const bindingKey = projectBindingKey(config, project);
-    const active = this.projectRun(phoneKey, project.alias);
+    const active = this.projectRun(phoneKey, project.alias, threadName);
     if (active) {
       await this.sendReply(
         remoteJid,
@@ -2916,21 +3057,18 @@ export class WhatsAppControllerBridge {
     if (!token) {
       await this.sendReply(
         remoteJid,
-        "Usage: /session <number|thread-id-prefix>\n/session <project> <number|thread-id-prefix>\n\nUse /sessions to list recent Codex threads first."
+        "Usage: /session <number|thread-id-prefix>\n/session <project> <number|thread-id-prefix>\n\nUse /sessions to list recent native sessions first."
       );
       return;
     }
 
     const threads = await this.runner.listCodexThreads({
-      codexBin: config.codexBin,
+      ...this.runnerOptions(project),
       host: resolveHost(config, project.host ?? "host"),
       workspace: project.workspace,
-      model: project.model ?? config.model,
-      profile: project.profile ?? config.profile,
-      search: project.search ?? config.search,
       limit: SESSION_CONNECT_SEARCH_LIMIT
     });
-    const { session } = this.getProjectSession(phoneKey, project.alias);
+    const { session } = this.getProjectSession(phoneKey, project.alias, threadName);
     const resolution = resolveThreadSelection(threads, token, session);
 
     if (!resolution.match) {
@@ -2948,7 +3086,7 @@ export class WhatsAppControllerBridge {
       if (!resolution.candidates.length) {
         await this.sendReply(
           remoteJid,
-          `No recent Codex thread matched "${token}". Use /sessions to inspect available threads.`
+          `No recent native session matched "${token}". Use /sessions to inspect available threads.`
         );
       } else {
         await this.sendReply(
@@ -2965,10 +3103,16 @@ export class WhatsAppControllerBridge {
       return;
     }
 
+    if (this.nativeThreadBusy(project, resolution.match.id)) {
+      await this.sendReply(remoteJid, "That native session is already running in another relay slot. Wait for it to finish before attaching it.");
+      return;
+    }
     const connected = await this.upsertProjectSession(phoneKey, project.alias, {
+      threadName,
       guard: () => {
         const current = this.configStore.data.projects.find((item) => item.alias === project.alias);
-        return current && !this.projectRun(phoneKey, project.alias) &&
+        return current && !this.projectRun(phoneKey, project.alias, threadName) &&
+          !this.nativeThreadBusy(project, resolution.match.id) &&
           projectBindingKey(this.configStore.data, current) === bindingKey;
       },
       chatPatch: {
@@ -2991,7 +3135,7 @@ export class WhatsAppControllerBridge {
     await this.sendReply(
       remoteJid,
       [
-        `Switched ${project.alias} to session ${shortThreadId(resolution.match.id)}.`,
+        `Switched ${project.alias}/${threadName} to session ${shortThreadId(resolution.match.id)}.`,
         resolution.match.name ? `name: ${resolution.match.name}` : null,
         sanitizeThreadPreview(resolution.match.preview)
           ? `preview: ${sanitizeThreadPreview(resolution.match.preview)}`
@@ -3090,7 +3234,8 @@ export class WhatsAppControllerBridge {
       config,
       parsed.projectAlias ?? activeProject.alias
     );
-    const active = this.projectRun(phoneKey, project.alias);
+    const { session, threadName } = this.getProjectSession(phoneKey, project.alias, parsed.threadName);
+    const active = this.projectRun(phoneKey, project.alias, threadName);
     if (active) {
       await this.sendReply(
         remoteJid,
@@ -3099,9 +3244,13 @@ export class WhatsAppControllerBridge {
       return;
     }
 
-    const { session } = this.getProjectSession(phoneKey, project.alias);
     const currentLevel = resolveSessionPermissionLevel(config, project, session);
     const trimmedPayload = String(payload ?? "").trim();
+
+    if (project.engine === "opencode" || project.engine === "claude") {
+      await this.sendReply(remoteJid, `Permissions for ${project.alias}/${threadName}: native. ${project.engine} uses its existing permission rules; this relay does not apply a Codex sandbox. Configure permission rules in that coding tool.`);
+      return;
+    }
 
     if (!trimmedPayload) {
       await this.sendReply(
@@ -3110,7 +3259,7 @@ export class WhatsAppControllerBridge {
           `Project: ${project.alias}`,
           `Current permissions: ${formatPermissionSummary(currentLevel)}`,
           "",
-          ...permissionLevelHelpList().map(
+          ...permissionLevelHelpList().filter(({ level }) => level !== "native").map(
             ({ level, description, dangerous }) =>
               `- ${level}${dangerous ? " (explicit confirmation required)" : ""}: ${description}`
           ),
@@ -3126,6 +3275,11 @@ export class WhatsAppControllerBridge {
     const confirmationToken = parsed.confirmationToken;
     const requestedLevel = normalizePermissionLevel(requestedToken);
 
+    if (requestedLevel === "native" && (!project.engine || project.engine === "codex")) {
+      await this.sendReply(remoteJid, "Codex requires read-only, workspace-write or danger-full-access permissions; native is for other coding tools.");
+      return;
+    }
+
     if (!requestedLevel) {
       await this.sendReply(
         remoteJid,
@@ -3137,6 +3291,7 @@ export class WhatsAppControllerBridge {
     const requestedConfig = permissionLevelConfig(requestedLevel);
     if (!requestedConfig.dangerous) {
       await this.upsertProjectSession(phoneKey, project.alias, {
+        threadName,
         chatPatch: {
           phoneKey,
           remoteJid,
@@ -3171,6 +3326,7 @@ export class WhatsAppControllerBridge {
       confirmationToken === pendingConfirmation.code
     ) {
       await this.upsertProjectSession(phoneKey, project.alias, {
+        threadName,
         chatPatch: {
           phoneKey,
           remoteJid,
@@ -3195,6 +3351,7 @@ export class WhatsAppControllerBridge {
     const code = String(randomInt(100000, 1_000_000));
     const expiresAt = new Date(Date.now() + DANGER_CONFIRMATION_WINDOW_MS).toISOString();
     await this.upsertProjectSession(phoneKey, project.alias, {
+      threadName,
       chatPatch: {
         phoneKey,
         remoteJid,
@@ -3213,6 +3370,7 @@ export class WhatsAppControllerBridge {
       remoteJid,
       buildDangerFullAccessConfirmationMessage({
         projectAlias: project.alias,
+        threadName,
         confirmationCode: code,
         activeProjectAlias: activeProject.alias
       })
@@ -3244,18 +3402,24 @@ export class WhatsAppControllerBridge {
       target.targetType === "project"
         ? resolveConfiguredProject(config, target.projectAlias)
         : this.getActiveProject(phoneKey);
+    const threadName = this.getProjectSession(phoneKey, project.alias, target.threadName).threadName;
     const active =
       target.targetType === "btw"
         ? this.btwRun(phoneKey)
-        : this.projectRun(phoneKey, project.alias);
+        : this.projectRun(phoneKey, project.alias, threadName);
 
     if (!active?.pendingApproval) {
       await this.sendReply(
         remoteJid,
         target.targetType === "btw"
           ? "No approval is pending for btw."
-          : `No approval is pending for project ${project.alias}.`
+          : `No approval is pending for project ${project.alias}/${threadName}.`
       );
+      return;
+    }
+
+    if (active.cancelled) {
+      await this.sendReply(remoteJid, "This run is stopping or its interruption is unconfirmed. Check its native session before answering another approval.");
       return;
     }
 
@@ -3277,9 +3441,13 @@ export class WhatsAppControllerBridge {
 
     try {
       await active.answerApproval(pendingApproval.requestId, nextDecision);
-      active.pendingApproval = null;
+      if (active.pendingApproval?.requestId === pendingApproval.requestId) active.pendingApproval = null;
       if (target.targetType !== "btw") {
         await this.upsertProjectSession(phoneKey, project.alias, {
+          threadName,
+          guard: (session) => this.projectRun(phoneKey, project.alias, threadName) === active &&
+            (!active.bindingKey || session?.bindingKey === active.bindingKey) &&
+            (!session?.pendingApproval || session.pendingApproval.requestId === pendingApproval.requestId),
           projectPatch: {
             pendingApproval: null
           }
@@ -3289,7 +3457,7 @@ export class WhatsAppControllerBridge {
         remoteJid,
         target.targetType === "btw"
           ? `Sent ${nextDecision} for btw approval request ${pendingApproval.requestId}.`
-          : `Sent ${nextDecision} for project ${project.alias} approval request ${pendingApproval.requestId}.`
+          : `Sent ${nextDecision} for project ${project.alias}/${threadName} approval request ${pendingApproval.requestId}.`
       );
     } catch (error) {
       await this.sendReply(remoteJid, `Failed to answer approval request: ${error.message}`);
@@ -3319,39 +3487,50 @@ export class WhatsAppControllerBridge {
       target.targetType === "project"
         ? resolveConfiguredProject(config, target.projectAlias)
         : this.getActiveProject(phoneKey);
+    const threadName = this.getProjectSession(phoneKey, project.alias, target.threadName).threadName;
     const runKey =
       target.targetType === "btw"
         ? btwRunKey(phoneKey)
-        : projectRunKey(phoneKey, project.alias);
+        : projectRunKey(phoneKey, project.alias, threadName);
     const active = this.activeRuns.get(runKey);
     if (!active) {
       await this.sendReply(
         remoteJid,
         target.targetType === "btw"
           ? "No Codex run is active for btw."
-          : `No Codex run is active for project ${project.alias}.`
+          : `No Codex run is active for project ${project.alias}/${threadName}.`
       );
       return;
     }
 
     active.cancelled = true;
     active.stopping = true;
-    await active.interrupt().catch(() => {
-      if (!active.child.killed) {
-        active.child.kill("SIGTERM");
-      }
-    });
-    await delay(300);
-    if (!active.child.killed) {
-      active.child.kill("SIGKILL");
-    }
-
     const clearedQueued = await this.clearQueuedPrompts(phoneKey, {
       scopeType: target.targetType === "btw" ? "btw" : "project",
-      projectAlias: project.alias
+      projectAlias: project.alias,
+      threadName
     });
+    let interruptionError = null;
+    if (active.stopUnconfirmed && !active.nativeOutcomeConfirmed) {
+      interruptionError = new Error("The previous interruption was not confirmed. Inspect the native session before reconnecting; no new work was submitted.");
+    } else {
+      try { await active.interrupt(); }
+      catch (error) { interruptionError = error; }
+    }
+    if (interruptionError && !active.nativeOutcomeConfirmed) {
+      active.stopUnconfirmed = true;
+      active.status = "stop-unconfirmed";
+      if (active.child && !active.child.killed) active.child.kill?.("SIGTERM");
+      await this.sendReply(remoteJid, joinMessageSections(
+        `Interruption is unconfirmed for ${target.targetType === "btw" ? "btw" : `${project.alias}/${threadName}`}. The native session may still be running. This relay slot stays blocked until its outcome is confirmed.`,
+        interruptionError.message,
+        clearedQueued ? `Cleared ${clearedQueued} queued follow-up message${clearedQueued === 1 ? "" : "s"} for this scope.` : null
+      ));
+      return;
+    }
     if (target.targetType !== "btw") {
       await this.upsertProjectSession(phoneKey, project.alias, {
+        threadName,
         guard: (session) => this.activeRuns.get(runKey) === active &&
           (!active.bindingKey || active.bindingKey === session?.bindingKey),
         projectPatch: {
@@ -3365,7 +3544,7 @@ export class WhatsAppControllerBridge {
       joinMessageSections(
         target.targetType === "btw"
           ? "Stopped the active Codex run for btw."
-          : `Stopped the active Codex run for project ${project.alias}.`,
+          : `Stopped the active Codex run for project ${project.alias}/${threadName}.`,
         clearedQueued
           ? `Cleared ${clearedQueued} queued follow-up message${
               clearedQueued === 1 ? "" : "s"
@@ -3383,6 +3562,7 @@ export class WhatsAppControllerBridge {
     label,
     scopeType = "project",
     projectAlias = null,
+    threadName = null,
     voiceReplyOverride = null,
     statusPrelude = null,
     expectedBindingKey = null
@@ -3396,19 +3576,21 @@ export class WhatsAppControllerBridge {
       await this.sendReply(remoteJid, "The selected project is no longer configured. Use /projects to select a destination.");
       return;
     }
+    threadName = this.getProjectSession(phoneKey, project.alias, threadName).threadName;
+    const scopeLabel = this.sessionScopeLabel(phoneKey, project, threadName);
     const bindingKey = projectBindingKey(config, project);
     if (expectedBindingKey && expectedBindingKey !== bindingKey) {
       await this.sendReply(remoteJid, `The destination for ${project.alias} changed. The queued message was not sent. Select the intended host/project and resend it.`);
       return;
     }
     const runKey =
-      scopeType === "btw" ? btwRunKey(phoneKey) : projectRunKey(phoneKey, project.alias);
+      scopeType === "btw" ? btwRunKey(phoneKey) : projectRunKey(phoneKey, project.alias, threadName);
     const active = this.activeRuns.get(runKey);
     if (active) {
       const scopeLabel =
         scopeType === "btw"
           ? "btw"
-          : `project ${project.alias}`;
+          : `project ${project.alias}/${threadName}`;
       if (active.pendingApproval) {
         await this.sendReply(
           remoteJid,
@@ -3424,22 +3606,27 @@ export class WhatsAppControllerBridge {
       await this.sendReply(
         remoteJid,
         scopeType === "btw"
-          ? "Codex is already working on your previous btw request. Send /stop btw to cancel it first."
-          : `Codex is already working on your previous request in project ${project.alias} for session ${shortThreadId(
+          ? "The coding tool is already working on your previous btw request. Send /stop btw to cancel it first."
+          : `The coding tool is already working on your previous request in project ${project.alias}/${threadName} for session ${shortThreadId(
               active.threadId ?? null
-            )}. Send /stop ${project.alias} to cancel it first.`
+            )}. Send /stop ${project.alias}/${threadName} to cancel it first.`
       );
       return;
     }
 
     const projectSession =
       scopeType === "project"
-        ? chatSession.projects?.[project.alias] ?? defaultProjectSession()
+        ? this.getProjectSession(phoneKey, project.alias, threadName).session
         : defaultProjectSession();
     const existingThreadId =
       scopeType === "project" && !forceNewThread ? projectSession.threadId ?? null : null;
-    if (existingThreadId && (projectSession.bindingKey ? projectSession.bindingKey !== bindingKey : resolveHost(config, project.host ?? "host").transport !== "local")) {
+    if (existingThreadId && (projectSession.bindingKey ? projectSession.bindingKey !== bindingKey :
+      resolveHost(config, project.host ?? "host").transport !== "local" || (project.engine && project.engine !== "codex"))) {
       await this.sendReply(remoteJid, `The destination for ${project.alias} changed. Use /sessions and /session to reconnect on ${project.host ?? "host"}, or /new to start a fresh session.`);
+      return;
+    }
+    if (existingThreadId && this.nativeThreadBusy(project, existingThreadId, runKey)) {
+      await this.sendReply(remoteJid, `That native session is already running in another relay slot. Wait for it to finish or use /new in ${project.alias}/${threadName}.`);
       return;
     }
     const permissionLevel = resolveSessionPermissionLevel(config, project, projectSession);
@@ -3465,84 +3652,103 @@ export class WhatsAppControllerBridge {
     const ownsRun = () => this.activeRuns.get(runKey) === activeRun;
     const canUpdateSession = (session) => ownsRun() && !activeRun.cancelled && destinationUnchanged() &&
       (!session?.bindingKey || session.bindingKey === bindingKey);
-    const { child, interrupt, answerApproval, resultPromise } = this.runner.startCodexTurn({
-      codexBin: config.codexBin,
-      host: resolveHost(config, project.host ?? "host"),
-      workspace: project.workspace,
-      prompt: promptForCodex,
-      threadId: existingThreadId,
-      threadName: existingThreadId
-        ? null
-        : buildThreadName({
-            label,
-            phoneKey,
-            projectAlias: scopeType === "project" ? project.alias : null,
-            scopeType
-          }),
-      model: project.model ?? config.model,
-      profile: project.profile ?? config.profile,
-      search: project.search ?? config.search,
-      permissionLevel,
-      onApprovalRequest: async (approval) => {
-        const currentRun = this.activeRuns.get(runKey);
-        if (!currentRun || currentRun !== activeRun || !destinationUnchanged()) {
-          return;
-        }
+    const confirmNativeOutcome = () => {
+      if (!activeRun) return;
+      activeRun.nativeOutcomeConfirmed = true;
+      // Cleanup may already have returned after a failed interrupt. A later
+      // terminal native event can release that guard without restarting queues.
+      if (activeRun.stopUnconfirmed && ownsRun()) this.activeRuns.delete(runKey);
+    };
+    let turn;
+    try {
+      turn = this.runner.startCodexTurn({
+        ...this.runnerOptions(project),
+        host: resolveHost(config, project.host ?? "host"),
+        workspace: project.workspace,
+        prompt: promptForCodex,
+        threadId: existingThreadId,
+        threadName: existingThreadId
+          ? null
+          : buildThreadName({
+              label,
+              phoneKey,
+              projectAlias: scopeType === "project" ? `${project.alias}/${threadName}` : null,
+              scopeType
+            }),
+        permissionLevel,
+        onApprovalRequest: async (approval) => {
+          const currentRun = this.activeRuns.get(runKey);
+          if (!currentRun || currentRun !== activeRun || !destinationUnchanged()) {
+            return;
+          }
 
-        currentRun.pendingApproval = approval;
-        if (scopeType === "project") {
-          await this.upsertProjectSession(phoneKey, project.alias, {
-            guard: canUpdateSession,
-            projectPatch: {
-              pendingApproval: {
-                kind: approval.kind,
-                requestId: approval.requestId,
-                requestedAt: new Date().toISOString()
+          currentRun.pendingApproval = approval;
+          if (scopeType === "project") {
+            await this.upsertProjectSession(phoneKey, project.alias, {
+              threadName,
+              guard: canUpdateSession,
+              projectPatch: {
+                pendingApproval: {
+                  kind: approval.kind,
+                  requestId: approval.requestId,
+                  requestedAt: new Date().toISOString()
+                }
               }
-            }
-          });
-        }
-        await this.sendReply(
-          remoteJid,
-          [
-            scopeType === "btw"
-              ? `Approval needed for btw session ${shortThreadId(approval.threadId ?? existingThreadId)}.`
-              : `Approval needed for project ${project.alias} session ${shortThreadId(
-                  approval.threadId ?? existingThreadId
-                )}.`,
-            "",
-            formatApprovalDetails(approval)
-          ].join("\n")
-        );
-      },
-      onApprovalResolved: async () => {
-        const currentRun = this.activeRuns.get(runKey);
-        if (!currentRun || currentRun !== activeRun || !destinationUnchanged()) {
-          return;
-        }
+            });
+          }
+          await this.sendReply(
+            remoteJid,
+            [
+              scopeType === "btw"
+                ? `Approval needed for btw session ${shortThreadId(approval.threadId ?? existingThreadId)}.`
+                : `Approval needed for project ${project.alias}/${threadName} session ${shortThreadId(
+                    approval.threadId ?? existingThreadId
+                  )}.`,
+              "",
+              `${formatApprovalDetails(approval)}\nTarget this session: /approve ${scopeType === "btw" ? "btw" : `${project.alias}/${threadName}`}, /deny ${scopeType === "btw" ? "btw" : `${project.alias}/${threadName}`}, or /stop ${scopeType === "btw" ? "btw" : `${project.alias}/${threadName}`}.`
+            ].join("\n")
+          );
+        },
+        onApprovalResolved: async (resolution) => {
+          const currentRun = this.activeRuns.get(runKey);
+          if (!currentRun || currentRun !== activeRun || !destinationUnchanged()) {
+            return;
+          }
+          if (!resolution || currentRun.pendingApproval?.requestId !== resolution.requestId) return;
 
-        currentRun.pendingApproval = null;
-        if (scopeType === "project") {
-          await this.upsertProjectSession(phoneKey, project.alias, {
-            guard: canUpdateSession,
-            projectPatch: {
-              pendingApproval: null
-            }
-          });
-        }
-      },
-      onLifecycleEvent: (event) => {
-        const currentRun = this.activeRuns.get(runKey);
-        if (!currentRun || currentRun !== activeRun || !destinationUnchanged()) {
-          return;
-        }
+          currentRun.pendingApproval = null;
+          if (scopeType === "project") {
+            await this.upsertProjectSession(phoneKey, project.alias, {
+              threadName,
+              guard: (session) => canUpdateSession(session) &&
+                (!session?.pendingApproval || session.pendingApproval.requestId === resolution.requestId),
+              projectPatch: {
+                pendingApproval: null
+              }
+            });
+          }
+        },
+        onLifecycleEvent: (event) => {
+          const currentRun = this.activeRuns.get(runKey);
+          if (!currentRun || currentRun !== activeRun || !destinationUnchanged()) {
+            return;
+          }
 
-        applyRunLifecycleEvent(currentRun, event);
-      }
-    });
+          applyRunLifecycleEvent(currentRun, event);
+          if (event?.type === "turnCompleted") confirmNativeOutcome();
+        }
+      });
+    } catch (error) {
+      await this.sendReply(remoteJid, `Could not start ${scopeLabel}: ${error.message}`);
+      return;
+    }
+    const { child, interrupt, answerApproval, resultPromise } = turn;
     // Observe early transport failure while state updates and status replies await I/O.
     let resultSettled = false;
-    resultPromise.then(() => { resultSettled = true; }, () => { resultSettled = true; });
+    resultPromise.then(() => {
+      resultSettled = true;
+      confirmNativeOutcome();
+    }, () => { resultSettled = true; });
 
     activeRun = {
       bindingKey,
@@ -3560,14 +3766,17 @@ export class WhatsAppControllerBridge {
       progressPreview: null,
       voiceReply: cloneVoiceReplySetting(activeVoiceReply),
       scopeType,
-      projectAlias: scopeType === "project" ? project.alias : null
+      projectAlias: scopeType === "project" ? project.alias : null,
+      phoneKey,
+      threadName
     };
     this.activeRuns.set(runKey, activeRun);
-    const activeProjectAtDispatch = this.getActiveProject(phoneKey);
+    const activeScopeAtDispatch = this.sessionScopeLabel(phoneKey);
 
     try {
       if (scopeType === "project") {
         const initialized = await this.upsertProjectSession(phoneKey, project.alias, {
+          threadName,
           guard: () => ownsRun() && !activeRun.cancelled && destinationUnchanged(),
           chatPatch: {
             phoneKey,
@@ -3584,7 +3793,7 @@ export class WhatsAppControllerBridge {
             threadId: existingThreadId
           }
         });
-        if (!initialized) throw new Error("The project destination changed before Codex startup completed.");
+        if (!initialized) throw new Error("The project destination changed before coding-tool startup completed.");
       } else {
         await this.upsertChatSession(phoneKey, {
           phoneKey,
@@ -3600,19 +3809,19 @@ export class WhatsAppControllerBridge {
         joinMessageSections(
           statusPrelude,
           scopeType === "btw"
-            ? "Starting a disposable btw Codex session. I will answer here and then return to your current project."
-            : project.alias !== activeProjectAtDispatch.alias
-              ? `Started a one-off run in ${project.alias}. You are still in ${activeProjectAtDispatch.alias}. I will post the result here when it completes.`
+            ? "Starting a disposable btw session. I will answer here and then return to your current project."
+            : scopeLabel !== activeScopeAtDispatch
+              ? `Started a one-off run in ${scopeLabel}. You are still in ${activeScopeAtDispatch}. I will post the result here when it completes.`
               : existingThreadId
-                ? `Working in ${project.alias} session ${shortThreadId(existingThreadId)} with ${permissionLevel} permissions. I will post the result here when it completes.`
-                : `Starting a fresh Codex session in ${project.alias} with ${permissionLevel} permissions. I will post the result here when it completes.`
+                ? `Working in ${scopeLabel} session ${shortThreadId(existingThreadId)} with ${permissionLevel} permissions. I will post the result here when it completes.`
+                : `Starting a fresh session in ${scopeLabel} with ${permissionLevel} permissions. I will post the result here when it completes.`
         )
       );
 
       const result = await resultPromise;
       if (activeRun.cancelled || !ownsRun()) return;
       if (!destinationUnchanged()) {
-        await this.sendReply(remoteJid, "Codex finished on the previous project destination. Its result was not attached to the changed project; reconnect to the original machine to inspect that session.");
+        await this.sendReply(remoteJid, "The coding tool finished on the previous project destination. Its result was not attached to the changed project; reconnect to the original machine to inspect that session.");
         return;
       }
       const currentVoiceReply = resolveRunVoiceReply(activeRun, activeVoiceReply);
@@ -3621,11 +3830,12 @@ export class WhatsAppControllerBridge {
         replyEnvelope.text || (replyEnvelope.hasLanguageTag ? "" : result.replyText);
 
       if (!replyText) {
-        throw new Error("Codex returned an empty reply.");
+        throw new Error("The coding tool returned an empty reply.");
       }
 
       if (scopeType === "project") {
         const recorded = await this.upsertProjectSession(phoneKey, project.alias, {
+          threadName,
           guard: canUpdateSession,
           chatPatch: {
             phoneKey,
@@ -3655,14 +3865,14 @@ export class WhatsAppControllerBridge {
 
       if (currentVoiceReply.enabled) {
         try {
-          const activeProjectNow = this.getActiveProject(phoneKey);
-          if (scopeType === "project" && activeProjectNow.alias !== project.alias) {
+          const activeScopeNow = this.sessionScopeLabel(phoneKey);
+          if (scopeType === "project") {
             await this.sendReply(
               remoteJid,
               formatProjectRunReplyPrefix({
-                projectAlias: project.alias,
+                projectAlias: scopeLabel,
                 threadId: result.threadId,
-                activeProjectAlias: activeProjectNow.alias
+                activeProjectAlias: activeScopeNow
               })
             );
           }
@@ -3690,9 +3900,9 @@ export class WhatsAppControllerBridge {
               ? replyText
               : joinMessageSections(
                   formatProjectRunReplyPrefix({
-                    projectAlias: project.alias,
+                    projectAlias: scopeLabel,
                     threadId: result.threadId,
-                    activeProjectAlias: this.getActiveProject(phoneKey).alias
+                    activeProjectAlias: this.sessionScopeLabel(phoneKey)
                   }),
                   replyText
                 )
@@ -3707,9 +3917,9 @@ export class WhatsAppControllerBridge {
           ? replyText
           : joinMessageSections(
               formatProjectRunReplyPrefix({
-                projectAlias: project.alias,
+                projectAlias: scopeLabel,
                 threadId: result.threadId,
-                activeProjectAlias: this.getActiveProject(phoneKey).alias
+                activeProjectAlias: this.sessionScopeLabel(phoneKey)
               }),
               replyText
             )
@@ -3721,6 +3931,7 @@ export class WhatsAppControllerBridge {
 
       if (scopeType === "project") {
         const recorded = await this.upsertProjectSession(phoneKey, project.alias, {
+          threadName,
           guard: canUpdateSession,
           chatPatch: {
             phoneKey,
@@ -3739,12 +3950,12 @@ export class WhatsAppControllerBridge {
       await this.sendReply(
         remoteJid,
         scopeType === "btw"
-          ? `Codex btw run failed: ${error.message}`
+          ? `The btw run failed: ${error.message}`
           : joinMessageSections(
               formatProjectRunReplyPrefix({
-                projectAlias: project.alias,
+                projectAlias: scopeLabel,
                 threadId: activeRun.threadId ?? existingThreadId,
-                activeProjectAlias: this.getActiveProject(phoneKey).alias,
+                activeProjectAlias: this.sessionScopeLabel(phoneKey),
                 outcome: "failed"
               }),
               error.message
@@ -3752,14 +3963,22 @@ export class WhatsAppControllerBridge {
       );
     } finally {
       if (!resultSettled) {
-        try { await interrupt?.(); } catch { child.kill?.("SIGTERM"); }
-        if (!child.killed) child.kill?.("SIGTERM");
+        try { await interrupt?.(); }
+        catch (error) {
+          activeRun.cancelled = true;
+          activeRun.stopping = true;
+          activeRun.stopUnconfirmed = true;
+          activeRun.status = "stop-unconfirmed";
+          child?.kill?.("SIGTERM");
+          await this.sendReply(remoteJid, `Cleanup interruption is unconfirmed for ${scopeLabel}. Its native session may still be running; this relay slot stays blocked until its outcome is confirmed. ${error.message}`).catch(() => {});
+        }
+        if (child && !child.killed) child.kill?.("SIGTERM");
       }
       // A stopped run may finish after a replacement starts. Never delete it.
       const owned = ownsRun();
-      if (owned && !activeRun.stopping) this.activeRuns.delete(runKey);
+      if (owned && (!activeRun.stopping || (activeRun.stopUnconfirmed && activeRun.nativeOutcomeConfirmed))) this.activeRuns.delete(runKey);
       if (owned && !activeRun.cancelled && destinationUnchanged()) {
-        await this.runNextQueuedPrompt({ phoneKey, remoteJid, label, scopeType, projectAlias: project.alias });
+        await this.runNextQueuedPrompt({ phoneKey, remoteJid, label, scopeType, projectAlias: project.alias, threadName });
       }
     }
   }

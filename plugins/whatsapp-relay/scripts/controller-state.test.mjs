@@ -6,6 +6,69 @@ import path from "node:path";
 
 import { ControllerStateStore } from "./controller-state.mjs";
 
+async function savedStateFixture(t) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "controller-state-lock-test-"));
+  t.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const filePath = path.join(tempDir, "controller-state.json");
+  const store = new ControllerStateStore(filePath);
+  await store.upsertSession("123", { label: "before" });
+  return { tempDir, filePath, store, previous: await fs.readFile(filePath, "utf8") };
+}
+
+test("ControllerStateStore retries temporary Windows rename locks without replaying the mutation", { skip: process.platform !== "win32" }, async (t) => {
+  const { tempDir, filePath, store, previous } = await savedStateFixture(t);
+  const rename = fs.rename;
+  const temporaryPaths = [];
+  let mutations = 0;
+  t.mock.method(fs, "rename", async (source, destination) => {
+    assert.equal(destination, filePath);
+    temporaryPaths.push(source);
+    assert.equal(await fs.readFile(filePath, "utf8"), previous);
+    if (temporaryPaths.length < 3) throw Object.assign(new Error("temporary lock"), { code: temporaryPaths.length === 1 ? "EPERM" : "EBUSY" });
+    return rename(source, destination);
+  });
+
+  await store.mutateSession("123", (session) => { mutations += 1; session.label = "after"; });
+
+  assert.equal(mutations, 1);
+  assert.equal(temporaryPaths.length, 3);
+  assert.equal(new Set(temporaryPaths).size, 1);
+  assert.match(path.basename(temporaryPaths[0]), /^\.controller-state\.json\.\d+\.[\da-f-]{36}\.tmp$/);
+  assert.equal(JSON.parse(await fs.readFile(filePath, "utf8")).sessions["123"].label, "after");
+  assert.deepEqual(await fs.readdir(tempDir), ["controller-state.json"]);
+});
+
+test("ControllerStateStore bounds persistent rename locks and preserves the last saved state", async (t) => {
+  const { tempDir, filePath, store, previous } = await savedStateFixture(t);
+  const locked = Object.assign(new Error("persistent lock"), { code: "EACCES" });
+  let attempts = 0;
+  const replacement = t.mock.method(fs, "rename", async () => { attempts += 1; throw locked; });
+
+  await assert.rejects(store.mutateSession("123", (session) => { session.label = "must-not-save"; }), (error) => error === locked);
+
+  assert.equal(attempts, process.platform === "win32" ? 6 : 1);
+  assert.equal(await fs.readFile(filePath, "utf8"), previous);
+  assert.deepEqual(await fs.readdir(tempDir), ["controller-state.json"]);
+  replacement.mock.restore();
+  await store.mutateSession("456", (session) => { session.label = "recovered"; });
+  const saved = JSON.parse(await fs.readFile(filePath, "utf8"));
+  assert.equal(saved.sessions["123"].label, "before");
+  assert.equal(saved.sessions["456"].label, "recovered");
+});
+
+test("ControllerStateStore fails unrelated rename errors immediately and removes its temporary file", async (t) => {
+  const { tempDir, filePath, store, previous } = await savedStateFixture(t);
+  const failure = Object.assign(new Error("disk I/O error"), { code: "EIO" });
+  let attempts = 0;
+  t.mock.method(fs, "rename", async () => { attempts += 1; throw failure; });
+
+  await assert.rejects(store.mutateSession("123", (session) => { session.label = "must-not-save"; }), (error) => error === failure);
+
+  assert.equal(attempts, 1);
+  assert.equal(await fs.readFile(filePath, "utf8"), previous);
+  assert.deepEqual(await fs.readdir(tempDir), ["controller-state.json"]);
+});
+
 test("ControllerStateStore migrates legacy single-session fields into the active project", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "controller-state-test-"));
   const filePath = path.join(tempDir, "controller-state.json");

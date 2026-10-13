@@ -2,6 +2,8 @@
 
 The main PC runs one WhatsApp controller. A configured project selects either local Codex or Codex on the VM over SSH. The VM runs the relay worker on demand; it does not need a second WhatsApp login, controller daemon, agent framework, or memory service.
 
+For OpenCode/OpenChamber, Claude Code, or several simultaneous conversations in one project, see [named sessions and coding tools](multiple-agents.md). The machine and file setup below applies to all three engines.
+
 ```text
 WhatsApp phone
       |
@@ -34,8 +36,8 @@ If the noninteractive SSH environment cannot locate Node or Codex, configure abs
 Register the full release checkout's MCP server in Codex on the gateway PC. From the repository root in PowerShell:
 
 ```powershell
-$relayServer = (Resolve-Path ./plugins/whatsapp-relay/scripts/mcp-server.mjs).Path
-codex mcp add whatsapp-relay -- node $relayServer
+$relayLauncher = (Resolve-Path ./scripts/launch.mjs).Path
+codex mcp add whatsapp-relay -- node $relayLauncher mcp
 ```
 
 Restart Codex to load the tools. If an installed WhatsApp Relay plugin already provides them, use a single registration pointing at this checkout; avoid loading duplicate relay MCP servers. The VM only needs the worker checkout, not this WhatsApp MCP registration. This command changes the gateway user's Codex MCP configuration; it does not pair WhatsApp or start the controller.
@@ -84,7 +86,7 @@ Send commands from an allowed direct chat. A self-chat can be used when the link
 | `/files` | Lists up to 20 recent stored incoming/outgoing attachments for the active project. |
 | `/send reports/result.pdf` | Sends that workspace-relative file back to the chat. |
 
-Switching machines changes which project receives subsequent prompts and uploads. Each project keeps its own selected Codex thread. Existing desktop sessions are discoverable through the selected machine's native Codex account. This is session continuation through Codex's API; it is not desktop UI control.
+Switching machines changes which project receives subsequent prompts and uploads. Each project keeps its own named threads and selected thread. Existing desktop sessions are discoverable through the selected machine's native account. This continues native sessions through the tool's integration interface; it does not control desktop windows.
 
 ## Where files go
 

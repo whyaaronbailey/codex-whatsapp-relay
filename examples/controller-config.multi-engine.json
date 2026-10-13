@@ -1,0 +1,23 @@
+{
+  "enabled": false,
+  "defaultProject": "pc-code",
+  "permissionLevel": "workspace-write",
+  "hosts": [
+    { "id": "host", "label": "Main PC", "transport": "local" },
+    {
+      "id": "vm", "label": "Virtual machine", "transport": "ssh",
+      "target": "relay-vm", "platform": "win32", "nodeBin": "node",
+      "codexBin": "codex", "claudeBin": "claude",
+      "workerPath": "C:\\Relay\\codex-whatsapp-relay\\plugins\\whatsapp-relay\\scripts\\relay-worker.mjs"
+    }
+  ],
+  "projects": [
+    { "alias": "pc-code", "host": "host", "engine": "codex", "workspace": "C:\\Projects\\example" },
+    { "alias": "pc-open", "host": "host", "engine": "opencode", "workspace": "C:\\Projects\\example", "opencodeUrl": "http://127.0.0.1:4096", "opencodeApiVersion": "auto", "permissionLevel": "native" },
+    { "alias": "pc-claude", "host": "host", "engine": "claude", "workspace": "C:\\Projects\\example", "permissionLevel": "native" },
+    { "alias": "vm-code", "host": "vm", "engine": "codex", "workspace": "C:\\Projects\\example" },
+    { "alias": "vm-open", "host": "vm", "engine": "opencode", "workspace": "C:\\Projects\\example", "opencodeUrl": "http://127.0.0.1:4096", "opencodeApiVersion": "auto", "permissionLevel": "native" },
+    { "alias": "vm-claude", "host": "vm", "engine": "claude", "workspace": "C:\\Projects\\example", "permissionLevel": "native" }
+  ],
+  "allowedControllers": []
+}

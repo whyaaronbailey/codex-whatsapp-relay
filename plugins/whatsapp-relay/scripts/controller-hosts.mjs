@@ -8,6 +8,7 @@ const SSH_TARGET = /^[a-zA-Z0-9_][a-zA-Z0-9_.@:\[\]-]*$/;
 const NODE_COMMAND = /^[a-zA-Z0-9_./\\ :+-]+$/;
 const FILE_OPERATIONS = new Set(["file.writeIncoming", "file.readOutgoing", "file.list", "file.markSent"]);
 const CLASSIFICATION_OPERATIONS = new Set(["codex.classifyVoice", "codex.classifyProject"]);
+const AGENT_OPERATIONS = new Set(["agent.listThreads"]);
 
 function normalizeHost(host) {
   if (!host || typeof host !== "object" || !HOST_ID.test(host.id ?? "")) {
@@ -25,6 +26,7 @@ function normalizeHost(host) {
   const normalized = { id: host.id, transport, platform };
   if (host.label) normalized.label = String(host.label);
   if (host.codexBin) normalized.codexBin = String(host.codexBin);
+  if (host.claudeBin) normalized.claudeBin = String(host.claudeBin);
   if (transport === "ssh") {
     if (!SSH_TARGET.test(host.target ?? "")) {
       throw new Error(`Host ${host.id} requires a configured SSH target (an alias or user@hostname).`);
@@ -112,6 +114,11 @@ export function spawnHostAppServer({ host = null, codexBin = "codex", workspace,
 }
 
 export async function performHostOperation(request) {
+  if (AGENT_OPERATIONS.has(request?.operation)) {
+    const { listAgentThreadsLocal } = await import("./agent-runner.mjs");
+    const { operation, host: _ignored, ...params } = request;
+    return listAgentThreadsLocal(params);
+  }
   if (FILE_OPERATIONS.has(request?.operation)) {
     const { performFileOperation } = await import("./relay-file-ops.mjs");
     return performFileOperation(request);
@@ -126,7 +133,7 @@ export async function performHostOperation(request) {
 
 export async function requestHostOperation(host, request, { timeoutMs = 60_000, spawnImpl = spawn } = {}) {
   const resolved = host ? normalizeHost(host) : resolveHost();
-  if (!FILE_OPERATIONS.has(request?.operation) && !CLASSIFICATION_OPERATIONS.has(request?.operation)) {
+  if (!FILE_OPERATIONS.has(request?.operation) && !CLASSIFICATION_OPERATIONS.has(request?.operation) && !AGENT_OPERATIONS.has(request?.operation)) {
     throw new Error(`Unsupported worker operation: ${request?.operation}`);
   }
   const operationRequest = CLASSIFICATION_OPERATIONS.has(request.operation)

@@ -94,6 +94,7 @@ function defaultConfig() {
     projects: [],
     maxAttachmentBytes: 25 * 1024 * 1024,
     codexBin: "codex",
+    claudeBin: "claude",
     model: null,
     profile: null,
     permissionLevel: "workspace-write",
@@ -118,6 +119,7 @@ function normalizeConfig(config = {}) {
     throw new Error("maxAttachmentBytes must be a positive integer no larger than 25 MiB.");
   }
   merged.permissionLevel = resolvePermissionLevel(merged.permissionLevel);
+  if (merged.permissionLevel === "native") throw new Error("Global permissionLevel is a Codex setting; set native on individual OpenCode or Claude projects.");
   merged.ttsProvider = normalizeTtsProvider(merged.ttsProvider, "chatterbox-turbo");
   merged.ttsChatterboxAllowNonEnglish = normalizeBooleanish(
     merged.ttsChatterboxAllowNonEnglish,
