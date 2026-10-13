@@ -1,14 +1,19 @@
 node_modules/
+.whatsapp-relay/
 plugins/whatsapp-relay/.venv-chatterbox/
 
-plugins/whatsapp-relay/data/auth*/
-plugins/whatsapp-relay/data/controller-config.json
-plugins/whatsapp-relay/data/controller-state.json
-plugins/whatsapp-relay/data/controller.log
-plugins/whatsapp-relay/data/controller-outbox/
-plugins/whatsapp-relay/data/controller-outbox.failed/
-plugins/whatsapp-relay/data/store.json
-plugins/whatsapp-relay/data/runtime.json
+# Runtime state, auth, transfer queues, backups and any future voice caches.
+plugins/whatsapp-relay/data/*
+!plugins/whatsapp-relay/data/.gitkeep
+
+# Local secrets stay private; intentionally documented templates may be tracked.
+.env
+.env.*
+!.env.example
+!.env.sample
+
+__pycache__/
+*.py[cod]
 
 npm-debug.log*
 .worktrees

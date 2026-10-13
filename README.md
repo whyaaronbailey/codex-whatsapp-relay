@@ -1,5 +1,27 @@
 # Codex WhatsApp Relay
 
+This fork adds one WhatsApp gateway for Codex on a PC and a VM, with project-specific session routing and bidirectional file transfers. Based on [Adolfo Builes' original relay](https://github.com/abuiles/codex-whatsapp-relay).
+
+**Preview status:** host/VM routing and attachment support are available in this fork's preview release. Automated tests cover the bridge and worker on Windows and Linux; live WhatsApp pairing and PC-to-VM deployment must still be verified on your machines. Portable Windows voice dictation is deferred. See [releases](https://github.com/whyaaronbailey/codex-whatsapp-relay/releases) for the published tags; inherited tags through `v0.4.3` contain the original feature set.
+
+Start with [the host/VM setup guide](docs/host-vm.md) and [example configuration](examples/controller-config.host-vm.json). This uses each machine's existing Codex account, instructions and Hindsight connection, with no additional agent framework or memory store.
+
+```powershell
+git clone --branch v0.4.3 https://github.com/whyaaronbailey/codex-whatsapp-relay.git
+cd codex-whatsapp-relay
+npm ci
+npm run check
+npm test
+$relayServer = (Resolve-Path ./plugins/whatsapp-relay/scripts/mcp-server.mjs).Path
+codex mcp add whatsapp-relay -- node $relayServer
+```
+
+For an existing checkout, fetch tags and select the same release on both machines after preserving local changes. Run one linked WhatsApp gateway on the PC and the worker on the VM. Use `/hosts`, `/host vm <project>`, `/sessions`, `/new`, `/files` and `/send <relative path>`. Documents, images and videos save into the selected workspace's `.whatsapp-relay/inbox`; exports get persistent outbox snapshots and hash manifests. Transfers are limited to 25 MiB each.
+
+The relay source is [MIT licensed](LICENSE). See [attribution and third-party licenses](THIRD_PARTY_NOTICES.md), [contribution guidance](CONTRIBUTING.md), and [security reporting](SECURITY.md). Dependencies retain their own licenses. This is an independent community project using Baileys, an unofficial WhatsApp integration; it is not affiliated with OpenAI or WhatsApp/Meta. The repository remains `private: true` in `package.json` only to prevent accidental npm publication; source releases are public on GitHub.
+
+The rest of this README documents the inherited relay features. Voice instructions describe the upstream platform-specific implementation, not validated Windows voice support.
+
 Put Codex in your WhatsApp.
 
 WhatsApp Relay is a Codex plugin that links a local WhatsApp account to Codex, lets Codex read and send WhatsApp messages, and can optionally let you control Codex from an allowed direct chat.
@@ -22,13 +44,15 @@ The controller bridge is now project-aware. One chat can keep `api` busy, switch
 
 ## Install In Codex
 
+This installs the tagged preview from this fork as a direct MCP server using the full checkout. Follow [the host/VM guide](docs/host-vm.md) to configure machine routing and file transfers. The inherited plugin manifest is retained, but plugin-cache installation and its dependency placement have not been verified for this preview.
+
 Paste this prompt into Codex:
 
 ```text
-Install the WhatsApp Relay plugin globally for my user account.
+Install WhatsApp Relay for my user account through a direct Codex MCP registration.
 
 Use this repository as the source:
-https://github.com/abuiles/codex-whatsapp-relay
+https://github.com/whyaaronbailey/codex-whatsapp-relay
 
 Install the current release tag:
 v0.4.3
@@ -37,31 +61,24 @@ Do all of the following:
 
 1. Clone the repo into ~/.codex/plugins/whatsapp-relay if it does not exist yet.
 2. If it already exists, fetch tags and check out v0.4.3 without deleting unrelated user files.
-3. Run npm install inside ~/.codex/plugins/whatsapp-relay.
-4. Create or update ~/.agents/plugins/marketplace.json so it contains a personal marketplace entry for this plugin.
-5. Keep any existing marketplace entries that are already there.
-6. Make sure the plugin entry uses:
-   - name: whatsapp-relay
-   - source.source: local
-   - source.path: ./.codex/plugins/whatsapp-relay/plugins/whatsapp-relay
-   - policy.installation: AVAILABLE
-   - policy.authentication: ON_USE
-   - category: Productivity
-7. Do not create a repo-local marketplace entry.
-8. After writing the marketplace file, tell me to restart Codex.
-9. After restart, tell me to open /plugins and install WhatsApp Relay.
+3. Run npm ci inside ~/.codex/plugins/whatsapp-relay.
+4. Resolve the absolute path to plugins/whatsapp-relay/scripts/mcp-server.mjs in that checkout.
+5. Register it with: codex mcp add whatsapp-relay -- node <absolute-script-path>
+6. Preserve unrelated MCP entries and existing Hindsight configuration. If a relay registration already exists, inspect it and update only that entry. Avoid loading a duplicate relay through a plugin.
+7. Verify the registration with codex mcp list and tell me to restart Codex.
+8. After restart, verify the WhatsApp Relay tools are available. Pair WhatsApp only when I ask to link it.
 
-Do not push or publish anything. Only set up the local personal marketplace install.
+Only set up the local checkout and MCP registration. Do not push, publish, or start the controller.
 ```
 
 ## After Install
 
 1. Restart Codex.
-2. Open `/plugins`.
-3. Install `WhatsApp Relay`.
-4. Ask Codex to ping you on WhatsApp.
+2. Verify that the `whatsapp-relay` MCP tools are available.
+3. Ask Codex to link your WhatsApp account and verify the authentication status.
+4. Configure your controller allowlist and host/project destinations using the setup guide before starting phone control.
 
-If WhatsApp is not linked yet, Codex should first run the auth flow, wait for you to scan the QR code, verify the session, and then send the ping. If you want phone control, ask Codex to enable it. If you use the same WhatsApp account on your phone, `Message yourself` can be used as the control surface.
+The authentication flow shows a QR code for you to scan and verifies the session. If you want phone control, ask Codex to enable it after configuration. If you use the same WhatsApp account on your phone, `Message yourself` can be used as the control surface.
 
 ## How It Works
 

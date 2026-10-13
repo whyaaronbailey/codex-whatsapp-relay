@@ -3,13 +3,14 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolvePermissionLevel } from "./controller-permissions.mjs";
+import { normalizeConfiguredHosts } from "./controller-hosts.mjs";
 import { repoRoot } from "./paths.mjs";
 
 const DEFAULT_PROJECT_ALIAS = "main";
 const DEFAULT_SEARCH_ROOT_NAMES = ["code", "src", "workspace", "projects", "work"];
 const INVISIBLE_PROJECT_SPEC_PATTERN = /[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g;
 const MARKDOWN_LINK_PATTERN = /\[([^\]]*)\]\(([^)]+)\)/g;
-const PATH_REFERENCE_PATTERN = /(?:^|[\s<])((?:~\/|\.{1,2}\/|\/)[^\s)>]+)/;
+const PATH_REFERENCE_PATTERN = /(?:^|[\s<])((?:[a-z]:[\\/]|\\\\|~[\\/]|\.{1,2}[\\/]|\/)[^\s)>]+)/i;
 
 function stripDiacritics(value) {
   return String(value ?? "")
@@ -62,7 +63,7 @@ function isDirectoryPathLike(value) {
     source.startsWith("/") ||
     source.startsWith("~") ||
     source.startsWith(".") ||
-    source.includes(path.sep)
+    /[\\/]/.test(source)
   );
 }
 
@@ -132,6 +133,7 @@ export function normalizeProjectAlias(value, fallback = DEFAULT_PROJECT_ALIAS) {
 export function defaultProjectConfig() {
   return {
     alias: DEFAULT_PROJECT_ALIAS,
+    host: "host",
     workspace: repoRoot,
     model: null,
     profile: null,
@@ -140,13 +142,59 @@ export function defaultProjectConfig() {
   };
 }
 
-function normalizeProjectConfig(project = {}, { fallbackAlias = DEFAULT_PROJECT_ALIAS } = {}) {
-  const workspace = path.resolve(String(project.workspace ?? repoRoot));
+function workspacePathApi(workspace) {
+  return /^(?:[a-z]:[\\/]|\\\\)/i.test(workspace) ? path.win32 : path.posix;
+}
+
+function workspaceBasename(workspace) {
+  return workspacePathApi(workspace).basename(workspace);
+}
+
+function normalizeWorkspace(workspace, host) {
+  const source = String(workspace ?? "");
+  if (host.transport === "local") {
+    return path.resolve(source || repoRoot);
+  }
+
+  if (!source || /[\u0000-\u001f]/.test(source)) {
+    throw new Error(`Project workspace on host ${host.id} must be an absolute remote path.`);
+  }
+  const pathApi = host.platform === "win32" ? path.win32 : path.posix;
+  const isAbsolute = pathApi === path.win32
+    ? /^(?:[a-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/i.test(source)
+    : source.startsWith("/") && !source.startsWith("//") && !source.includes("\\");
+  if (!isAbsolute) {
+    throw new Error(`Project workspace on host ${host.id} must be an absolute remote path: ${source}`);
+  }
+  return pathApi.normalize(source);
+}
+
+function workspaceKey(project) {
+  const pathApi = workspacePathApi(project.workspace);
+  let workspace = pathApi.normalize(project.workspace);
+  if (workspace !== pathApi.parse(workspace).root) {
+    workspace = workspace.replace(/[\\/]+$/, "");
+  }
+  // Windows workspace names are case-insensitive; POSIX names are not.
+  return `${project.host}\u0000${workspacePathApi(workspace) === path.win32 ? workspace.toLowerCase() : workspace}`;
+}
+
+function normalizeProjectConfig(project = {}, { fallbackAlias = DEFAULT_PROJECT_ALIAS, hosts } = {}) {
+  if (!project || typeof project !== "object" || Array.isArray(project)) {
+    throw new Error("Each project must be a configuration object.");
+  }
+  const hostId = project.host ?? "host";
+  const host = hosts.find((candidate) => candidate.id === hostId);
+  if (!host) {
+    throw new Error(`Project ${project.alias ?? fallbackAlias} references unknown host: ${String(hostId)}`);
+  }
+  const workspace = normalizeWorkspace(project.workspace, host);
   return {
     alias: normalizeProjectAlias(
-      project.alias ?? path.basename(workspace) ?? fallbackAlias,
+      project.alias ?? workspaceBasename(workspace) ?? fallbackAlias,
       fallbackAlias
     ),
+    host: host.id,
     workspace,
     model: project.model ?? null,
     profile: project.profile ?? null,
@@ -158,6 +206,7 @@ function normalizeProjectConfig(project = {}, { fallbackAlias = DEFAULT_PROJECT_
 }
 
 export function normalizeConfiguredProjects(config = {}) {
+  const hosts = normalizeConfiguredHosts(config);
   const rawProjects =
     Array.isArray(config.projects) && config.projects.length
       ? config.projects
@@ -176,14 +225,15 @@ export function normalizeConfiguredProjects(config = {}) {
   const seenWorkspaces = new Set();
   const projects = rawProjects.flatMap((project, index) => {
     const normalized = normalizeProjectConfig(project, {
-      fallbackAlias: index === 0 ? DEFAULT_PROJECT_ALIAS : `project-${index + 1}`
+      fallbackAlias: index === 0 ? DEFAULT_PROJECT_ALIAS : `project-${index + 1}`,
+      hosts
     });
-    const workspaceKey = path.resolve(normalized.workspace);
-    if (seenWorkspaces.has(workspaceKey)) {
+    const key = workspaceKey(normalized);
+    if (seenWorkspaces.has(key)) {
       return [];
     }
 
-    seenWorkspaces.add(workspaceKey);
+    seenWorkspaces.add(key);
     return [{
       ...normalized,
       alias: ensureUniqueAlias(normalized.alias, seenAliases)
@@ -206,44 +256,79 @@ export function normalizeConfiguredProjects(config = {}) {
   };
 }
 
-export function findConfiguredProject(config = {}, token = null) {
-  return resolveConfiguredProjectSelection(config, token).match;
+export function findConfiguredProject(config = {}, token = null, options = {}) {
+  return resolveConfiguredProjectSelection(config, token, options).match;
 }
 
-export function resolveExplicitConfiguredProject(config = {}, token = null) {
-  const { projects, defaultProject } = normalizeConfiguredProjects(config);
+function projectsForHost(config, hostId) {
+  const normalized = normalizeConfiguredProjects(config);
+  if (hostId !== null && hostId !== undefined) {
+    const hosts = normalizeConfiguredHosts(config);
+    if (!hosts.some((host) => host.id === hostId)) {
+      throw new Error(`Unknown host: ${String(hostId)}`);
+    }
+    normalized.projects = normalized.projects.filter((project) => project.host === hostId);
+  }
+  return normalized;
+}
+
+function extractPathReference(token) {
+  // A bare absolute path can contain spaces. Preserve it before looking for an
+  // embedded path in prose such as "project /home/user/project".
+  if (/^(?:[a-z]:[\\/]|\\\\|~[\\/]|\.{1,2}[\\/]|\/)/i.test(token)) {
+    return token;
+  }
+  return token.match(PATH_REFERENCE_PATTERN)?.[1] ??
+    (isDirectoryPathLike(token) ? token : null);
+}
+
+function explicitProjectCandidates(config, projects, token, defaultProject) {
+  const normalizedToken = normalizeProjectAlias(token, defaultProject);
+  const aliasMatch = projects.find((project) => project.alias === normalizedToken);
+  if (aliasMatch && !isDirectoryPathLike(token)) {
+    return [aliasMatch];
+  }
+  const hosts = normalizeConfiguredHosts(config);
+  const pathReference =
+    extractPathReference(token);
+  if (pathReference) {
+    const workspaceMatches = projects.filter((project) => {
+      const host = hosts.find((candidate) => candidate.id === project.host);
+      try {
+        const workspace = normalizeWorkspace(
+          host.transport === "local" ? expandHomePath(pathReference) : pathReference,
+          host
+        );
+        return workspaceKey({ ...project, workspace }) === workspaceKey(project);
+      } catch {
+        return false;
+      }
+    });
+    if (workspaceMatches.length) {
+      return workspaceMatches;
+    }
+    return [];
+  }
+
+  return projects.filter((project) =>
+    normalizeProjectAlias(workspaceBasename(project.workspace), project.alias) === normalizedToken
+  );
+}
+
+export function resolveExplicitConfiguredProject(config = {}, token = null, { hostId } = {}) {
+  const { projects, defaultProject } = projectsForHost(config, hostId);
   const sanitizedToken = sanitizeProjectSpec(token);
   if (!sanitizedToken) {
     return null;
   }
-
-  const pathReference =
-    sanitizedToken.match(PATH_REFERENCE_PATTERN)?.[1] ??
-    (isDirectoryPathLike(sanitizedToken) ? sanitizedToken : null);
-  if (pathReference) {
-    const resolvedPath = path.resolve(expandHomePath(pathReference));
-    const workspaceMatch = projects.find(
-      (project) => path.resolve(project.workspace) === resolvedPath
-    );
-    if (workspaceMatch) {
-      return workspaceMatch;
-    }
-  }
-
-  const normalizedToken = normalizeProjectAlias(sanitizedToken, defaultProject);
-
-  return (
-    projects.find((project) => project.alias === normalizedToken) ??
-    projects.find(
-      (project) =>
-        normalizeProjectAlias(path.basename(project.workspace), project.alias) === normalizedToken
-    ) ??
-    null
+  const candidates = explicitProjectCandidates(
+    config, projects, sanitizedToken, defaultProject
   );
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
-export function resolveConfiguredProjectSelection(config = {}, token = null) {
-  const { projects, defaultProject } = normalizeConfiguredProjects(config);
+export function resolveConfiguredProjectSelection(config = {}, token = null, { hostId } = {}) {
+  const { projects, defaultProject } = projectsForHost(config, hostId);
   const sanitizedToken = sanitizeProjectSpec(token);
   if (!sanitizedToken) {
     return {
@@ -252,11 +337,13 @@ export function resolveConfiguredProjectSelection(config = {}, token = null) {
     };
   }
 
-  const direct = resolveExplicitConfiguredProject(config, sanitizedToken);
-  if (direct) {
+  const directCandidates = explicitProjectCandidates(
+    config, projects, sanitizedToken, defaultProject
+  );
+  if (directCandidates.length) {
     return {
-      match: direct,
-      candidates: [direct]
+      match: directCandidates.length === 1 ? directCandidates[0] : null,
+      candidates: directCandidates
     };
   }
 
@@ -264,7 +351,7 @@ export function resolveConfiguredProjectSelection(config = {}, token = null) {
 
   const prefixMatches = projects.filter((project) => {
     const workspaceAlias = normalizeProjectAlias(
-      path.basename(project.workspace),
+      workspaceBasename(project.workspace),
       project.alias
     );
     return (
@@ -285,12 +372,16 @@ export function resolveConfiguredProjectSelection(config = {}, token = null) {
   };
 }
 
-export function resolveConfiguredProject(config = {}, token = null) {
-  const { projects, defaultProject } = normalizeConfiguredProjects(config);
+export function resolveConfiguredProject(config = {}, token = null, { hostId } = {}) {
+  const { projects, defaultProject } = projectsForHost(config, hostId);
+  const selection = resolveConfiguredProjectSelection(config, token ?? defaultProject, { hostId });
+  if (selection.candidates.length > 1) {
+    return null;
+  }
   return (
-    resolveConfiguredProjectSelection(config, token ?? defaultProject).match ??
+    selection.match ??
     projects.find((project) => project.alias === defaultProject) ??
-    null
+    projects[0] ?? null
   );
 }
 
@@ -442,13 +533,13 @@ async function searchWorkspaceFromReference(spec, { homeDir, repoRootDir }) {
 export function deriveProjectAlias(workspace, config = {}) {
   const { projects } = normalizeConfiguredProjects(config);
   const seenAliases = new Set(projects.map((project) => project.alias));
-  return ensureUniqueAlias(path.basename(workspace), seenAliases);
+  return ensureUniqueAlias(workspaceBasename(workspace), seenAliases);
 }
 
 export async function resolveProjectReference(
   config = {},
   spec,
-  { homeDir = os.homedir(), repoRootDir = repoRoot, skipConfiguredSelection = false } = {}
+  { homeDir = os.homedir(), repoRootDir = repoRoot, skipConfiguredSelection = false, hostId } = {}
 ) {
   const trimmed = sanitizeProjectSpec(spec);
   if (!trimmed) {
@@ -456,7 +547,7 @@ export async function resolveProjectReference(
   }
 
   if (!skipConfiguredSelection) {
-    const configuredSelection = resolveConfiguredProjectSelection(config, trimmed);
+    const configuredSelection = resolveConfiguredProjectSelection(config, trimmed, { hostId });
     if (configuredSelection.match) {
       return {
         project: configuredSelection.match,
@@ -475,14 +566,29 @@ export async function resolveProjectReference(
     }
   }
 
-  const pathReference =
-    trimmed.match(PATH_REFERENCE_PATTERN)?.[1] ??
-    (isDirectoryPathLike(trimmed) ? trimmed : null);
+  const hosts = normalizeConfiguredHosts(config);
+  const defaultHostId = resolveConfiguredProject(config)?.host ?? "host";
+  const targetHostId = hostId ?? defaultHostId;
+  const targetHost = hosts.find((host) => host.id === targetHostId);
+  if (!targetHost) {
+    throw new Error(`Unknown host: ${String(targetHostId)}`);
+  }
+  // Discovery scans this process's filesystem. Never substitute a local
+  // directory for a remote path or project with a similar name.
+  const configuredSelection = resolveConfiguredProjectSelection(config, trimmed);
+  if (targetHost.transport !== "local" ||
+      configuredSelection.candidates.some((project) =>
+        hosts.find((host) => host.id === project.host)?.transport !== "local"
+      )) {
+    return null;
+  }
+
+  const pathReference = extractPathReference(trimmed);
   const directPath = pathReference
     ? path.resolve(expandHomePath(pathReference, homeDir))
     : null;
   if (directPath && (await directoryExists(directPath))) {
-    const existingWorkspace = findConfiguredProject(config, directPath);
+    const existingWorkspace = findConfiguredProject(config, directPath, { hostId: targetHostId });
     if (existingWorkspace) {
       return {
         project: existingWorkspace,
@@ -494,6 +600,7 @@ export async function resolveProjectReference(
     return {
       project: {
         ...defaultProjectConfig(),
+        host: targetHostId,
         alias: deriveProjectAlias(directPath, config),
         workspace: directPath
       },
@@ -508,7 +615,7 @@ export async function resolveProjectReference(
   });
 
   if (discovered.workspace) {
-    const existingWorkspace = findConfiguredProject(config, discovered.workspace);
+    const existingWorkspace = findConfiguredProject(config, discovered.workspace, { hostId: targetHostId });
     if (existingWorkspace) {
       return {
         project: existingWorkspace,
@@ -520,6 +627,7 @@ export async function resolveProjectReference(
     return {
       project: {
         ...defaultProjectConfig(),
+        host: targetHostId,
         alias: deriveProjectAlias(discovered.workspace, config),
         workspace: discovered.workspace
       },

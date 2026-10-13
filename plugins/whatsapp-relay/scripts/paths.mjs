@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,15 +18,15 @@ export const controllerOutboxDir = path.join(dataDir, "controller-outbox");
 export const controllerOutboxFailedDir = path.join(dataDir, "controller-outbox.failed");
 export const controllerDaemonScript = path.join(scriptDir, "controller-daemon.mjs");
 export const globalControllerOwnerFile = path.join(
-  process.env.HOME ?? repoRoot,
+  os.homedir(),
   ".codex",
   "plugins",
   "whatsapp-relay",
   "controller-owner.json"
 );
 
-export async function ensureRuntimeDirs() {
-  await fs.mkdir(authDir, { recursive: true });
-  await fs.mkdir(controllerOutboxDir, { recursive: true });
-  await fs.mkdir(controllerOutboxFailedDir, { recursive: true });
+export async function ensureRuntimeDirs(runtimeDir = dataDir) {
+  await fs.mkdir(path.join(runtimeDir, "auth"), { recursive: true });
+  await fs.mkdir(path.join(runtimeDir, "controller-outbox"), { recursive: true });
+  await fs.mkdir(path.join(runtimeDir, "controller-outbox.failed"), { recursive: true });
 }

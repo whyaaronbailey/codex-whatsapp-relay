@@ -42,6 +42,6 @@ When refreshing the locally installed Codex plugin after a release:
 ## Notes
 
 - The repo's primary branch is `main`.
-- The canonical repository URL is `https://github.com/abuiles/codex-whatsapp-relay`. Keep plugin metadata and README install instructions aligned with the actual git remote.
+- The fork repository URL is `https://github.com/whyaaronbailey/codex-whatsapp-relay`; upstream is `https://github.com/abuiles/codex-whatsapp-relay`. Keep plugin metadata and README install instructions aligned with the actual git remote and preserve upstream attribution.
 - The README install prompt is part of the release surface and must be updated on every new release.
 - The goal is that a fresh Codex install follows the latest tagged release by default.
