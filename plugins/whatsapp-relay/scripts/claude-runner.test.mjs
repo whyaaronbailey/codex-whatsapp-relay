@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -140,10 +141,39 @@ test("Claude host discovery caps results at 200 and ignores linked project direc
   await Promise.all(Array.from({ length: 205 }, () => transcript(config)));
   const external = { ...config, claudeConfigDir: path.join(config.workspace, "external-config") };
   const linked = await transcript(external, { title: "Must not follow linked index" });
-  await fs.symlink(path.dirname(linked.file), path.join(config.claudeConfigDir, "projects", "linked-project"), process.platform === "win32" ? "junction" : "dir");
+  const linkPath = path.join(config.claudeConfigDir, "projects", "linked-project");
+  await fs.symlink(path.dirname(linked.file), linkPath, process.platform === "win32" ? "junction" : "dir");
+  assert.ok((await fs.lstat(linkPath)).isSymbolicLink(), "fixture is a real linked directory");
   const rows = await listClaudeThreads({ ...config, scope: "host", limit: 1000 });
   assert.equal(rows.length, 200);
   assert.ok(rows.every(row => row.id !== linked.id));
+});
+
+test("Claude rejects linked project directories even when readdir reports a plain directory", async t => {
+  const config = await fixture(t);
+  const saved = await transcript(config);
+  const external = { ...config, claudeConfigDir: path.join(config.workspace, "external-config") };
+  const linked = await transcript(external);
+  const projects = path.join(config.claudeConfigDir, "projects");
+  await fs.symlink(path.dirname(linked.file), path.join(projects, "linked-project"), process.platform === "win32" ? "junction" : "dir");
+  const opendir = fsSync.opendirSync;
+  // Reproduce Windows Node 20's junction Dirent classification on every
+  // supported platform/runtime, while lstat still examines the real link.
+  t.mock.method(fsSync, "opendirSync", (directory, ...args) => {
+    const handle = opendir(directory, ...args);
+    if (directory !== projects) return handle;
+    return {
+      readSync() {
+        const entry = handle.readSync();
+        return entry?.name === "linked-project"
+          ? { name: entry.name, isDirectory: () => true, isSymbolicLink: () => false }
+          : entry;
+      },
+      closeSync() { handle.closeSync(); }
+    };
+  });
+  const rows = await listClaudeThreads({ ...config, scope: "host" });
+  assert.deepEqual(rows.map(row => row.id), [saved.id]);
 });
 
 test("Claude permission mappings never request a bypass and surface native denials", async t => {

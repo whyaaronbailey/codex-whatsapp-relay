@@ -77,7 +77,17 @@ function projectDirectories(workspace, claudeConfigDir, scope = "workspace") {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
       if (scope !== "host" && !(process.platform === "win32"
         ? entry.name.toLowerCase() === slug.toLowerCase() : entry.name === slug)) continue;
-      matches.push(path.join(projects, entry.name));
+      const candidate = path.join(projects, entry.name);
+      // Windows Node 20 readdir may classify a junction as an ordinary
+      // directory. Check the path itself before opening any native index.
+      try {
+        const stat = fs.lstatSync(candidate);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+      } catch (error) {
+        if (["ENOENT", "EACCES", "EPERM"].includes(error.code)) continue;
+        throw error;
+      }
+      matches.push(candidate);
       if (matches.length > MAX_PROJECT_DIRECTORIES) throw new Error("Claude session index exceeds the project scan limit. Use workspace scope.");
     }
   } finally { directory.closeSync(); }
