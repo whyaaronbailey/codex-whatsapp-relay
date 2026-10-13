@@ -7,7 +7,7 @@ This fork adds one WhatsApp gateway for Codex on a PC and a VM, with project-spe
 Start with [the host/VM setup guide](docs/host-vm.md) and [example configuration](examples/controller-config.host-vm.json). This uses each machine's existing Codex account, instructions and Hindsight connection, with no additional agent framework or memory store.
 
 ```powershell
-git clone --branch v0.4.3 https://github.com/whyaaronbailey/codex-whatsapp-relay.git
+git clone --branch v0.5.0 https://github.com/whyaaronbailey/codex-whatsapp-relay.git
 cd codex-whatsapp-relay
 npm ci
 npm run check
@@ -55,12 +55,12 @@ Use this repository as the source:
 https://github.com/whyaaronbailey/codex-whatsapp-relay
 
 Install the current release tag:
-v0.4.3
+v0.5.0
 
 Do all of the following:
 
 1. Clone the repo into ~/.codex/plugins/whatsapp-relay if it does not exist yet.
-2. If it already exists, fetch tags and check out v0.4.3 without deleting unrelated user files.
+2. If it already exists, fetch tags and check out v0.5.0 without deleting unrelated user files.
 3. Run npm ci inside ~/.codex/plugins/whatsapp-relay.
 4. Resolve the absolute path to plugins/whatsapp-relay/scripts/mcp-server.mjs in that checkout.
 5. Register it with: codex mcp add whatsapp-relay -- node <absolute-script-path>

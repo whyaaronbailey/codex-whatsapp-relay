@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-13
+
 ### Added
 
 - Host and VM project routing through one WhatsApp gateway and on-demand SSH workers, preserving each machine's native Codex environment and memory configuration.

@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-relay",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Control native Codex sessions on a PC and VM from WhatsApp, with workspace file transfers.",
   "install_url": "https://raw.githubusercontent.com/whyaaronbailey/codex-whatsapp-relay/refs/heads/main/plugins/whatsapp-relay/.codex-plugin/plugin.json",
   "author": {

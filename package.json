@@ -1,6 +1,6 @@
 {
   "name": "codex-whatsapp",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "WhatsApp control of native Codex sessions on a PC and VM, with workspace file transfers.",
