@@ -5,6 +5,24 @@ import { normalizeProjectAlias } from "./controller-projects.mjs";
 import { controllerStateFile } from "./paths.mjs";
 
 const DEFAULT_PROJECT_ALIAS = "main";
+export const DEFAULT_THREAD_NAME = "main";
+
+export function normalizeThreadName(value) {
+  const name = String(value ?? DEFAULT_THREAD_NAME).trim().toLowerCase();
+  return /^(?!__proto__$|constructor$|prototype$)[a-z0-9][a-z0-9_-]{0,47}$/.test(name) ? name : null;
+}
+
+// Keep the original project fields as the main slot so existing state consumers
+// and pre-named-session installations keep their native thread and queue.
+export function projectThreadSession(project = {}, threadName = null, create = false) {
+  const name = normalizeThreadName(threadName ?? project.activeThread) ?? DEFAULT_THREAD_NAME;
+  if (name === DEFAULT_THREAD_NAME) return project;
+  if (create) {
+    project.namedThreads ??= {};
+    if (!Object.hasOwn(project.namedThreads, name)) project.namedThreads[name] = defaultProjectSession();
+  }
+  return Object.hasOwn(project.namedThreads ?? {}, name) ? project.namedThreads[name] : defaultProjectSession();
+}
 const LEGACY_PROJECT_FIELDS = [
   "threadId",
   "permissionLevel",
@@ -35,6 +53,7 @@ function normalizeQueuedPrompt(value = {}) {
     forceNewThread: Boolean(value.forceNewThread),
     queuedAt: typeof value.queuedAt === "string" ? value.queuedAt : null,
     projectAlias: typeof value.projectAlias === "string" ? value.projectAlias : null,
+    threadName: normalizeThreadName(value.threadName) ?? DEFAULT_THREAD_NAME,
     bindingKey: typeof value.bindingKey === "string" ? value.bindingKey : null,
     voiceReplyOverride:
       value.voiceReplyOverride?.enabled
@@ -121,11 +140,25 @@ function extractLegacyProjectSession(value = {}) {
 }
 
 function normalizeProjectSession(value = {}) {
+  const namedThreads = Object.fromEntries(Object.entries(value.namedThreads ?? {})
+    .filter(([name]) => normalizeThreadName(name) === name && name !== DEFAULT_THREAD_NAME)
+    .map(([name, slot]) => {
+      const { activeThread, namedThreads: nested, ...fields } = slot ?? {};
+      return [name, { ...defaultProjectSession(), ...fields,
+        queuedPrompts: normalizeQueuedPromptList(fields.queuedPrompts),
+        lastThreadChoices: Array.isArray(fields.lastThreadChoices) ? fields.lastThreadChoices : [] }];
+    }));
+  const activeThread = normalizeThreadName(value.activeThread) ?? DEFAULT_THREAD_NAME;
+  if (activeThread !== DEFAULT_THREAD_NAME && !Object.hasOwn(namedThreads, activeThread)) {
+    namedThreads[activeThread] = defaultProjectSession();
+  }
   return {
     ...defaultProjectSession(),
     ...value,
     lastThreadChoices: Array.isArray(value.lastThreadChoices) ? value.lastThreadChoices : [],
-    queuedPrompts: normalizeQueuedPromptList(value.queuedPrompts)
+    queuedPrompts: normalizeQueuedPromptList(value.queuedPrompts),
+    activeThread,
+    namedThreads
   };
 }
 
@@ -294,7 +327,7 @@ export class ControllerStateStore {
     return Object.entries(this.data.sessions).map(([phoneKey, session]) => {
       const normalized = normalizeChatSession(session, phoneKey);
       const activeProject = normalized.activeProject;
-      const activeProjectSession = normalized.projects[activeProject] ?? defaultProjectSession();
+      const activeProjectSession = projectThreadSession(normalized.projects[activeProject]);
       return {
         phoneKey,
         ...normalized,

@@ -1,10 +1,10 @@
 # Codex WhatsApp Relay
 
-This fork adds one WhatsApp gateway for Codex on a PC and a VM, with project-specific session routing and bidirectional file transfers. Based on [Adolfo Builes' original relay](https://github.com/abuiles/codex-whatsapp-relay).
+This fork adds one WhatsApp gateway for Codex, OpenCode/OpenChamber and Claude Code on a PC and a VM, with named parallel sessions and bidirectional file transfers. Based on [Adolfo Builes' original relay](https://github.com/abuiles/codex-whatsapp-relay).
 
-**Preview status:** host/VM routing and attachment support are available in this fork's preview release. Automated tests cover the bridge and worker on Windows and Linux; live WhatsApp pairing and PC-to-VM deployment must still be verified on your machines. Portable Windows voice dictation is deferred. See [releases](https://github.com/whyaaronbailey/codex-whatsapp-relay/releases) for the published tags; inherited tags through `v0.4.3` contain the original feature set.
+**Preview status:** host/VM routing, named sessions, multiple coding engines and attachments are available in this fork's preview release. Automated tests cover the bridge and worker on Windows and Linux; live WhatsApp pairing and PC-to-VM deployment must still be verified on your machines. Portable Windows voice dictation is deferred. See [releases](https://github.com/whyaaronbailey/codex-whatsapp-relay/releases) for the published tags; inherited tags through `v0.4.3` contain the original feature set.
 
-Start with [the host/VM setup guide](docs/host-vm.md) and [example configuration](examples/controller-config.host-vm.json). This uses each machine's existing Codex account, instructions and Hindsight connection, with no additional agent framework or memory store.
+Start with [the host/VM setup guide](docs/host-vm.md), [named sessions and coding tools](docs/multiple-agents.md), and [example configuration](examples/controller-config.host-vm.json). This uses each machine's existing accounts, instructions and Hindsight connections, with no additional agent framework or memory store.
 
 ```powershell
 git clone --branch v0.5.0 https://github.com/whyaaronbailey/codex-whatsapp-relay.git
@@ -12,8 +12,8 @@ cd codex-whatsapp-relay
 npm ci
 npm run check
 npm test
-$relayServer = (Resolve-Path ./plugins/whatsapp-relay/scripts/mcp-server.mjs).Path
-codex mcp add whatsapp-relay -- node $relayServer
+$relayLauncher = (Resolve-Path ./scripts/launch.mjs).Path
+codex mcp add whatsapp-relay -- node $relayLauncher mcp
 ```
 
 For an existing checkout, fetch tags and select the same release on both machines after preserving local changes. Run one linked WhatsApp gateway on the PC and the worker on the VM. Use `/hosts`, `/host vm <project>`, `/sessions`, `/new`, `/files` and `/send <relative path>`. Documents, images and videos save into the selected workspace's `.whatsapp-relay/inbox`; exports get persistent outbox snapshots and hash manifests. Transfers are limited to 25 MiB each.
@@ -62,8 +62,8 @@ Do all of the following:
 1. Clone the repo into ~/.codex/plugins/whatsapp-relay if it does not exist yet.
 2. If it already exists, fetch tags and check out v0.5.0 without deleting unrelated user files.
 3. Run npm ci inside ~/.codex/plugins/whatsapp-relay.
-4. Resolve the absolute path to plugins/whatsapp-relay/scripts/mcp-server.mjs in that checkout.
-5. Register it with: codex mcp add whatsapp-relay -- node <absolute-script-path>
+4. Resolve the absolute path to scripts/launch.mjs in that checkout.
+5. Register it with: codex mcp add whatsapp-relay -- node <absolute-launcher-path> mcp
 6. Preserve unrelated MCP entries and existing Hindsight configuration. If a relay registration already exists, inspect it and update only that entry. Avoid loading a duplicate relay through a plugin.
 7. Verify the registration with codex mcp list and tell me to restart Codex.
 8. After restart, verify the WhatsApp Relay tools are available. Pair WhatsApp only when I ask to link it.

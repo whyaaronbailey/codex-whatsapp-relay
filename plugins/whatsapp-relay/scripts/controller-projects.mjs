@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { resolvePermissionLevel } from "./controller-permissions.mjs";
+import { normalizePermissionLevel, resolvePermissionLevel } from "./controller-permissions.mjs";
 import { normalizeConfiguredHosts } from "./controller-hosts.mjs";
 import { repoRoot } from "./paths.mjs";
 
@@ -134,6 +134,7 @@ export function defaultProjectConfig() {
   return {
     alias: DEFAULT_PROJECT_ALIAS,
     host: "host",
+    engine: "codex",
     workspace: repoRoot,
     model: null,
     profile: null,
@@ -176,7 +177,7 @@ function workspaceKey(project) {
     workspace = workspace.replace(/[\\/]+$/, "");
   }
   // Windows workspace names are case-insensitive; POSIX names are not.
-  return `${project.host}\u0000${workspacePathApi(workspace) === path.win32 ? workspace.toLowerCase() : workspace}`;
+  return `${project.host}\u0000${project.engine ?? "codex"}\u0000${workspacePathApi(workspace) === path.win32 ? workspace.toLowerCase() : workspace}`;
 }
 
 function normalizeProjectConfig(project = {}, { fallbackAlias = DEFAULT_PROJECT_ALIAS, hosts } = {}) {
@@ -189,18 +190,42 @@ function normalizeProjectConfig(project = {}, { fallbackAlias = DEFAULT_PROJECT_
     throw new Error(`Project ${project.alias ?? fallbackAlias} references unknown host: ${String(hostId)}`);
   }
   const workspace = normalizeWorkspace(project.workspace, host);
+  const engine = project.engine ?? "codex";
+  if (!["codex", "opencode", "claude"].includes(engine)) throw new Error(`Unsupported project engine: ${engine}`);
+  const permission = project.permissionLevel ? normalizePermissionLevel(project.permissionLevel) : null;
+  if (project.permissionLevel && !permission) throw new Error(`Unknown permission level for ${project.alias ?? fallbackAlias}.`);
+  if (engine === "codex" && permission === "native") throw new Error("Codex projects require a Codex sandbox permission level.");
+  if (engine !== "codex" && permission && permission !== "native") throw new Error(`${engine} projects use native permissions; Codex sandbox levels do not apply.`);
+  const providerOptions = {};
+  if (engine === "opencode") {
+    if (!project.opencodeUrl) throw new Error("OpenCode projects require opencodeUrl pointing at the existing server.");
+    let endpoint;
+    try { endpoint = new URL(project.opencodeUrl); } catch { throw new Error("opencodeUrl must be an HTTP(S) origin."); }
+    if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash || endpoint.pathname !== "/") {
+      throw new Error("opencodeUrl must be an HTTP(S) origin without credentials, a path, query, or fragment.");
+    }
+    providerOptions.opencodeUrl = endpoint.origin;
+    providerOptions.opencodeApiVersion = project.opencodeApiVersion ?? "auto";
+    if (!["auto", "v1", "v2"].includes(providerOptions.opencodeApiVersion)) throw new Error("opencodeApiVersion must be auto, v1, or v2.");
+    for (const field of ["opencodeUsernameEnv", "opencodePasswordEnv"]) {
+      if (project[field] !== undefined) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(project[field])) throw new Error(`${field} must name an environment variable.`);
+        providerOptions[field] = project[field];
+      }
+    }
+  }
   return {
     alias: normalizeProjectAlias(
       project.alias ?? workspaceBasename(workspace) ?? fallbackAlias,
       fallbackAlias
     ),
     host: host.id,
+    engine,
     workspace,
+    ...providerOptions,
     model: project.model ?? null,
     profile: project.profile ?? null,
-    permissionLevel: project.permissionLevel
-      ? resolvePermissionLevel(project.permissionLevel)
-      : null,
+    permissionLevel: permission ?? (engine === "codex" ? null : "native"),
     search: typeof project.search === "boolean" ? project.search : null
   };
 }

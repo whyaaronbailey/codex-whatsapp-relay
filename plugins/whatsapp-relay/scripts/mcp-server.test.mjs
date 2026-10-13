@@ -157,7 +157,7 @@ test("status identifies each host and the active session host", async (t) => {
   const text = resultText(response);
   assert.match(text, /host_count: 2/);
   assert.match(text, /vm transport=ssh platform=linux/);
-  assert.match(text, /vm-work host=vm workspace=\/srv\/work/);
+  assert.match(text, /vm-work host=vm engine=codex workspace=\/srv\/work/);
   assert.match(text, /active_project=vm-work.*host=vm/);
   assert.match(text, /max_attachment_bytes: 1024/);
 });

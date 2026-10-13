@@ -1,6 +1,11 @@
 const DEFAULT_PERMISSION_LEVEL = "workspace-write";
 
 const PERMISSION_LEVELS = {
+  native: {
+    description: "Use the coding tool's existing permission rules. This is not a Codex OS sandbox.",
+    dangerous: false,
+    helpName: "native"
+  },
   "read-only": {
     approvalPolicyCli: "never",
     approvalPolicyAppServer: "never",
@@ -38,6 +43,7 @@ const PERMISSION_LEVELS = {
 };
 
 const LEVEL_ALIASES = new Map([
+  ["native", "native"],
   ["auto", "workspace-write"],
   ["danger", "danger-full-access"],
   ["dfa", "danger-full-access"],
@@ -91,6 +97,7 @@ export function permissionLevelConfig(level) {
 
 export function appServerPermissionParams(level) {
   const config = permissionLevelConfig(level);
+  if (config.level === "native") throw new Error("Codex requires read-only, workspace-write, or danger-full-access permissions.");
   return {
     approvalPolicy: config.approvalPolicyAppServer,
     sandboxPolicy: {
@@ -101,6 +108,7 @@ export function appServerPermissionParams(level) {
 
 export function cliPermissionOverrides(level) {
   const config = permissionLevelConfig(level);
+  if (config.level === "native") throw new Error("Codex requires read-only, workspace-write, or danger-full-access permissions.");
   return {
     approvalPolicy: config.approvalPolicyCli,
     sandboxMode: config.sandboxModeCli

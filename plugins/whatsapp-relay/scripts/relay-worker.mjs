@@ -43,6 +43,12 @@ export async function runWorker({ input = process.stdin, output = process.stdout
   try {
     const { request, remainder } = await readFirstRequest(input);
     operation = request.operation;
+    if (operation === "agent.run") {
+      const { startAgentTurnLocal } = await import("./agent-runner.mjs");
+      const { runAgentWorker } = await import("./agent-transport.mjs");
+      await runAgentWorker(request, remainder, { input, output, startTurn: startAgentTurnLocal });
+      return;
+    }
     if (request.operation !== "codex.appServer") {
       const result = await performHostOperation(request);
       const line = `${JSON.stringify({ result })}\n`;
@@ -87,6 +93,7 @@ export async function runWorker({ input = process.stdin, output = process.stdout
     });
   } catch (error) {
     if (operation === "codex.appServer") errorOutput.write(`${error.message}\n`);
+    else if (operation === "agent.run") output.write(`${JSON.stringify({ type: "error", error: { message: error.message } })}\n`);
     else output.write(`${JSON.stringify({ error: error.message, code: error.code, retryable: error.retryable })}\n`);
     process.exitCode = 1;
     input.destroy();

@@ -104,6 +104,7 @@ function controllerSummaryLines(config, processStatus) {
     `default_project: ${config.defaultProject}`,
     `workspace: ${config.workspace}`,
     `codex_bin: ${config.codexBin}`,
+    `claude_bin: ${config.claudeBin}`,
     `default_permission_level: ${config.permissionLevel}`,
     `capture_all_direct_messages: ${config.captureAllDirectMessages ? "yes" : "no"}`,
     `tts_provider: ${config.ttsProvider}`,
@@ -156,7 +157,7 @@ function controllerSummaryLines(config, processStatus) {
     lines.push("projects:");
     for (const project of config.projects) {
       lines.push(
-        `- ${project.alias}${project.alias === config.defaultProject ? " (default)" : ""} host=${project.host ?? "host"} workspace=${project.workspace}`
+        `- ${project.alias}${project.alias === config.defaultProject ? " (default)" : ""} host=${project.host ?? "host"} engine=${project.engine ?? "codex"} workspace=${project.workspace}`
       );
     }
   }
@@ -295,7 +296,7 @@ server.tool(
 
 server.tool(
   "whatsapp_allow_controller",
-  "Allow a WhatsApp number to control Codex through the controller bridge.",
+  "Allow a WhatsApp number to control configured coding sessions through the controller bridge.",
   {
     number: z.string().min(5),
     label: z.string().min(1).optional()
@@ -339,7 +340,7 @@ server.tool(
 
 server.tool(
   "whatsapp_controller_status",
-  "Show whether the WhatsApp-to-Codex controller bridge is configured and running.",
+  "Show configured machines, coding tools and projects, and whether the WhatsApp controller is running.",
   {},
   async () => {
     try {
@@ -354,7 +355,7 @@ server.tool(
 
 server.tool(
   "whatsapp_start_controller_bridge",
-  "Start the background WhatsApp-to-Codex controller bridge for allowed numbers.",
+  "Start the background WhatsApp controller for allowed numbers, configured machines and coding tools.",
   {
     workspace: z.string().min(1).optional(),
     defaultProject: z.string().min(1).optional(),
@@ -364,6 +365,7 @@ server.tool(
       transport: z.enum(["local", "ssh"]).optional(),
       platform: z.enum(["win32", "linux", "darwin", "windows", "posix"]).optional(),
       codexBin: z.string().min(1).optional(),
+      claudeBin: z.string().min(1).optional(),
       target: z.string().min(1).optional(),
       workerPath: z.string().min(1).optional(),
       nodeBin: z.string().min(1).optional()
@@ -374,7 +376,12 @@ server.tool(
         z.object({
           alias: z.string().min(1).optional(),
           host: z.string().min(1).optional(),
+          engine: z.enum(["codex", "opencode", "claude"]).optional(),
           workspace: z.string().min(1),
+          opencodeUrl: z.string().url().optional(),
+          opencodeApiVersion: z.enum(["auto", "v1", "v2"]).optional(),
+          opencodeUsernameEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(),
+          opencodePasswordEnv: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/).optional(),
           model: z.string().min(1).optional(),
           profile: z.string().min(1).optional(),
           permissionLevel: z.string().min(1).optional(),
@@ -384,6 +391,8 @@ server.tool(
       .min(1)
       .optional(),
     model: z.string().min(1).optional(),
+    codexBin: z.string().min(1).optional(),
+    claudeBin: z.string().min(1).optional(),
     profile: z.string().min(1).optional(),
     permissionLevel: z.string().min(1).optional(),
     search: z.boolean().optional(),
@@ -397,6 +406,8 @@ server.tool(
     hosts,
     maxAttachmentBytes,
     projects,
+    codexBin,
+    claudeBin,
     model,
     profile,
     permissionLevel,
@@ -429,6 +440,8 @@ server.tool(
         ...(hosts !== undefined ? { hosts } : {}),
         ...(maxAttachmentBytes !== undefined ? { maxAttachmentBytes } : {}),
         ...(projects ? { projects } : {}),
+        ...(codexBin ? { codexBin } : {}),
+        ...(claudeBin ? { claudeBin } : {}),
         ...(model ? { model } : {}),
         ...(profile ? { profile } : {}),
         ...(permissionLevel
@@ -456,8 +469,8 @@ server.tool(
           "WhatsApp controller bridge is running.",
           ...controllerSummaryLines(config, processStatus),
           "",
-          "Allowed direct chats can now send plain text to continue their Codex session.",
-          "Bridge commands: /hosts, /host <id>, /projects, /project <n|alias|hint>, /files, /send <relative-path>, /in, /btw, /n, /st, /ls, /1 or /session, /p, /a, /d, /q, /x, /h"
+          "Allowed direct chats can now send plain text to continue their selected coding session.",
+          "Bridge commands: /hosts, /host <id>, /projects, /project <alias>, /threads, /thread <name>, /in <project/thread> <prompt>, /sessions, /session <number>, /files, /send <relative-path>, /status, /stop, /help"
         ].join("\n")
       );
     } catch (error) {
