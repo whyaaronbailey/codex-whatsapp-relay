@@ -169,9 +169,14 @@ test("native session list and connect capture their slot across slow provider ca
   const list = f.bridge.sendThreadList(phoneKey, request.remoteJid);
   await f.select("review");
   listing.resolve([{ id: "chosen", name: "Chosen native" }]); await list;
+  assert.match(f.replies.at(-1), /\/session pc\/build 1/);
+  assert.doesNotMatch(f.replies.at(-1), /\/\d+\b|\/session <|\/connect </);
   assert.equal(f.stateStore.getSession(phoneKey).projects.pc.namedThreads.build.lastThreadChoices[0].id, "chosen");
   assert.equal(f.stateStore.getSession(phoneKey).projects.pc.namedThreads.review.lastThreadChoices.length, 0);
   await f.bridge.connectToThread({ ...request, payload: "pc/build 1" });
+  assert.match(f.replies.at(-1), /\/in pc\/build <prompt>/);
+  assert.doesNotMatch(f.replies.at(-1), /Next: send a normal message/);
+  assert.equal(f.bridge.getProjectSession(phoneKey).threadName, "review");
   assert.equal(f.stateStore.getSession(phoneKey).projects.pc.namedThreads.build.threadId, "chosen");
   assert.equal(f.stateStore.getSession(phoneKey).projects.pc.namedThreads.review.threadId, null);
 });

@@ -67,6 +67,8 @@ The example targets a Windows PC and Windows VM. The SSH launcher uses Windows P
 
 Use distinct aliases such as `pc-work` and `vm-work` even if both machines store the project at an identical path. Remote POSIX paths remain POSIX paths when the gateway runs on Windows. An ambiguous workspace path or basename requires an explicit project alias or host selection. Remote projects must be configured ahead of time; local directory discovery does not search a VM.
 
+To resume an existing VM conversation, set its project's `workspace` to the folder that conversation actually uses. Pointing every project at the relay's installation folder will only find sessions from that folder. `/sessions` reports the host, engine and workspace it searches. Select the correct project first, then use `/sessions` and `/session <number>` to attach the existing conversation.
+
 ## Control sessions from WhatsApp
 
 Send commands from an allowed direct chat. A self-chat can be used when the linked WhatsApp account is your own.

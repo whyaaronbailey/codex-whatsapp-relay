@@ -51,6 +51,84 @@ test("host switch routes native list, resume and new turns independently", async
   assert.ok(f.messages.every((message) => message.content.linkPreview === null));
 });
 
+test("native session list identifies the exact remote scope and preserves the named target in its shortcut", async (t) => {
+  const f = await fixture(t);
+  await f.bridge.sendThreadList(request.phoneKey, request.remoteJid, "guest/review");
+  const reply = f.messages.at(-1).content.text;
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].host.id, "vm");
+  assert.equal(f.calls[0].workspace, "C:\\work\\project");
+  assert.match(reply, /Host: vm \| engine: codex \| relay slot: guest\/review/);
+  assert.ok(reply.includes("Workspace: C:\\work\\project"));
+  assert.match(reply, /Existing/);
+  assert.match(reply, /\/session guest\/review <number>/);
+  assert.match(reply, /\/session guest\/review 1/);
+  assert.doesNotMatch(reply, /\/\d+\b|\/session <|\/connect </);
+  assert.match(reply, /Only native sessions in this workspace are searched/);
+  assert.equal(f.stateStore.getSession(request.phoneKey).activeProject, "desktop");
+});
+
+test("attaching to another relay slot gives scoped follow-up commands without selecting that slot", async (t) => {
+  const f = await fixture(t);
+  await f.bridge.connectToThread({ ...request, payload: "guest/review vm-thread" });
+  const reply = f.messages.at(-1).content.text;
+  assert.match(reply, /Attached session .* to guest\/review/);
+  assert.match(reply, /active relay slot is unchanged/);
+  assert.match(reply, /\/in guest\/review <prompt>/);
+  assert.match(reply, /\/project guest, then \/thread review/);
+  assert.doesNotMatch(reply, /Next: send a normal message/);
+  assert.equal(f.stateStore.getSession(request.phoneKey).activeProject, "desktop");
+  assert.equal(f.bridge.getProjectSession(request.phoneKey, "guest").threadName, "main");
+  assert.equal(f.bridge.getProjectSession(request.phoneKey, "guest", "review").session.threadId, "vm-thread");
+  await f.bridge.runPrompt({ ...request, prompt: "normal follow-up" });
+  assert.equal(f.calls.at(-1).host.id, "host");
+  await f.bridge.runPrompt({ ...request, projectAlias: "guest", threadName: "review", prompt: "targeted follow-up" });
+  assert.equal(f.calls.at(-1).host.id, "vm");
+  assert.equal(f.calls.at(-1).threadId, "vm-thread");
+});
+
+test("the selected relay slot retains working shorthand and normal-message guidance", async (t) => {
+  const f = await fixture(t);
+  await f.bridge.sendThreadList(request.phoneKey, request.remoteJid);
+  assert.match(f.messages.at(-1).content.text, /Use \/1, \/2/);
+  await f.bridge.connectToThread({ ...request, payload: "1" });
+  assert.match(f.messages.at(-1).content.text, /Next: send a normal message/);
+  assert.equal(f.bridge.getProjectSession(request.phoneKey).session.threadId, "host-thread");
+});
+
+test("an empty native session list explains its workspace and how to select another configured folder", async (t) => {
+  const f = await fixture(t);
+  await f.configStore.update({ projects: f.configStore.data.projects.map((project) =>
+    project.alias === "guest" ? { ...project, engine: "opencode", opencodeUrl: "http://127.0.0.1:4096", permissionLevel: "native" } : project) });
+  f.bridge.runner.listCodexThreads = async (args) => { f.calls.push(args); return []; };
+  await f.bridge.sendThreadList(request.phoneKey, request.remoteJid, "guest");
+  const reply = f.messages.at(-1).content.text;
+  assert.equal(f.calls[0].engine, "opencode");
+  assert.match(reply, /No native sessions were found in this workspace/);
+  assert.match(reply, /Host: vm \| engine: opencode \| relay slot: guest\/main/);
+  assert.ok(reply.includes("Workspace: C:\\work\\project"));
+  assert.match(reply, /\/projects.*\/project <alias>/);
+});
+
+test("remote discovery errors are returned with scope for both list and attach without changing the selected session", async (t) => {
+  const f = await fixture(t);
+  await f.configStore.update({ projects: f.configStore.data.projects.map((project) =>
+    project.alias === "guest" ? { ...project, engine: "claude", permissionLevel: "native" } : project) });
+  f.bridge.runner.listCodexThreads = async () => { throw new Error("Permission denied (publickey)."); };
+  await f.bridge.sendThreadList(request.phoneKey, request.remoteJid, "guest/review");
+  await f.bridge.connectToThread({ ...request, payload: "guest/review existing-id" });
+  assert.equal(f.messages.length, 2);
+  for (const { content } of f.messages) {
+    assert.match(content.text, /Could not list native sessions/);
+    assert.match(content.text, /Host: vm \| engine: claude \| relay slot: guest\/review/);
+    assert.ok(content.text.includes("Workspace: C:\\work\\project"));
+    assert.match(content.text, /Error: Permission denied \(publickey\)/);
+    assert.match(content.text, /Only native sessions in this workspace are searched/);
+  }
+  assert.equal(f.stateStore.getSession(request.phoneKey).activeProject, "desktop");
+  assert.equal(f.bridge.getProjectSession(request.phoneKey, "guest", "review").session.threadId, null);
+});
+
 test("existing threads and queued content cannot follow a remapped project", async (t) => {
   const f = await fixture(t);
   await f.bridge.runPrompt({ ...request, prompt: "first" });
