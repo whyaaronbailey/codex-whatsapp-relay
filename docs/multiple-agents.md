@@ -18,7 +18,7 @@ Find missing tests for the parser
 
 `/thread <name>` creates an empty named thread if necessary and selects it; its first prompt creates a native session. Names use letters, numbers, underscores or hyphens. `/threads` lists the relay's named threads. `/sessions` browses native conversations across the selected computer, or within an optional directory filter; `/session 1` selects a listed conversation and its directory/engine. Switching conversations does not stop other runs. Plain text and file captions go to the selected thread. `/in <directory-shortcut>/<thread> <prompt>` addresses another thread without switching.
 
-Each thread has its own pending messages, permissions, native ID and run state. `/status <project>/<thread>` and `/stop <project>/<thread>` target it explicitly. Bare `/approve`, `/deny`, and `/cancel` apply to the currently selected thread, even when other runs are waiting. Use an explicit target such as `/approve pc-code/review` to answer another thread's request; each approval message includes its target. The relay refuses to run the same native session simultaneously through two slots it controls. Other clients remain independent: finish their current turn before resuming that native session through WhatsApp.
+Each thread has its own pending messages, permissions, native ID and run state. `/status <project>/<thread>` and `/stop <project>/<thread>` target it explicitly. Bare `/approve`, `/deny`, and `/cancel` apply to the currently selected thread, even when other runs are waiting. Use an explicit target such as `/approve pc-code/review` to answer another thread's request; each approval message includes its target. The relay refuses to run the same native session simultaneously through two slots it controls. Other clients remain independent; Codex writer ownership can remain held even while a desktop conversation is idle.
 
 Parallel conversations in one folder share its files. Use separate worktrees/project folders when agents should edit independently. Incoming and outgoing attachments remain in that project's `.whatsapp-relay` storage; named threads do not silently duplicate or isolate files.
 
@@ -28,7 +28,7 @@ See [the multi-engine example](../examples/controller-config.multi-engine.json).
 
 ### Codex
 
-Uses the existing native `codex app-server`, account and local session store. Supports its existing sandbox modes and interactive approvals through the relay. Each named thread maps to a native Codex thread.
+Launches a separate native `codex app-server` using the existing account and local session store. Supports its existing sandbox modes and interactive approvals through the relay. Each named thread maps to a native Codex thread. It cannot attach to a conversation still owned by the desktop app's server. When `thread/resume` refuses with `already has an active writer`, no new turn has been submitted; finish desktop work and fully quit the owning client before resending, or explicitly start a different conversation with `/new`. See [operational limits](host-vm.md#operational-limits-and-validation).
 
 ### OpenCode and OpenChamber
 

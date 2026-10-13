@@ -36,7 +36,7 @@ async function fixture(t) {
   const runtime = { downloadMediaBuffer: async () => Buffer.from("file"), ensureConnected: async () => ({ sendMessage: async () => ({}) }) };
   const fileService = { saveIncomingAttachment: async (args) => { files.push(args); return { relativePath: ".whatsapp-relay/inbox/id/file.txt", size: 4, sha256: "abc", mimetype: "text/plain" }; } };
   const bridge = new WhatsAppControllerBridge({ runtime, configStore, stateStore, runner, fileService });
-  bridge.sendReply = async (_jid, text) => { replies.push(text); if (/Starting a fresh|Working in|Started a one-off/.test(text)) {
+  bridge.sendReply = async (_jid, text) => { replies.push(text); if (/Connecting to the coding tool|The coding tool accepted/.test(text)) {
     const call = calls.find((item) => !item.didStart && (!item.args.threadName || text.includes(item.args.threadName.match(/\[([^\]]+)\]/)?.[1])));
     if (call) { call.didStart = true; call.started.resolve(); }
   } };
@@ -252,4 +252,97 @@ test("provider startup failures return a scoped error and leave no busy slot", a
   await f.bridge.runPrompt({ ...request, prompt: "first", threadName: "review" });
   assert.equal(f.bridge.activeRuns.size, 0);
   assert.match(f.replies.at(-1), /Could not start host\/codex\/pc\/review: Coding tool unavailable/);
+});
+
+test("writer ownership failure leaves the native conversation selected and holds queued prompts without replay", async (t) => {
+  const f = await fixture(t);
+  await f.bridge.upsertProjectSession(phoneKey, "pc", { projectPatch: { threadId: "owned-native", connectedThreadName: "Existing conversation" } });
+  const running = f.bridge.runPrompt({ ...request, prompt: "first message" });
+  await f.calls[0].started.promise;
+  const ack = f.replies.at(-1);
+  assert.match(ack, /Connecting to the coding tool/);
+  assert.match(ack, /Computer: host \| tool: codex/);
+  assert.match(ack, /Session: Existing conversation — owned-native/);
+  assert.match(ack, /Directory:/);
+  assert.doesNotMatch(ack, /Working in|Project .*working|accepted your message/);
+  await f.bridge.queuePromptIfBusy({ ...request, projectAlias: "pc", prompt: "keep next one" });
+  await f.bridge.queuePromptIfBusy({ ...request, projectAlias: "pc", prompt: "keep next two" });
+  f.calls[0].result.reject(Object.assign(new Error("Another Codex client owns this conversation, even if that client is idle."), {
+    code: "ERR_CODEX_THREAD_OWNED", stage: "thread/resume", promptSubmitted: false, retryable: false
+  }));
+  await running;
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.bridge.projectRun(phoneKey, "pc"), undefined);
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.threadId, "owned-native");
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.queuedPrompts.length, 2);
+  assert.match(f.replies.at(-1), /Your message was not submitted/);
+  assert.match(f.replies.at(-1), /original conversation has been preserved/);
+  assert.match(f.replies.at(-1), /keep ownership while idle/);
+  assert.match(f.replies.at(-1), /2 queued message\(s\) are held/);
+  await f.stateStore.load();
+  assert.equal(await f.bridge.runNextQueuedPrompt({ ...request, projectAlias: "pc" }), false);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.queuedPrompts.length, 2);
+  const manualRetry = f.bridge.runPrompt({ ...request, prompt: "new manually sent message" });
+  await f.calls[1].started.promise;
+  f.calls[1].result.resolve({ threadId: "owned-native", replyText: "Now accepted" });
+  await manualRetry;
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.queuedPrompts.length, 2);
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.queuedPromptsPaused, true);
+  await f.bridge.stopActiveRun(phoneKey, request.remoteJid, "pc/main");
+  assert.match(f.replies.at(-1), /Cleared 2 queued follow-up messages/);
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.queuedPromptsPaused, false);
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.threadId, "owned-native");
+});
+
+test("writer wording after a started turn cannot claim that the message was not submitted", async (t) => {
+  const f = await fixture(t);
+  const running = f.bridge.runPrompt({ ...request, prompt: "started message" });
+  await f.calls[0].started.promise;
+  f.calls[0].args.onLifecycleEvent({ type: "turnStarted", threadId: "native", turnId: "turn-1" });
+  f.calls[0].result.reject(Object.assign(new Error("already has an active writer"), {
+    code: "ERR_CODEX_THREAD_OWNED", stage: "thread/resume", promptSubmitted: false
+  }));
+  await running;
+  assert.doesNotMatch(f.replies.at(-1), /message was not submitted/);
+  assert.match(f.replies.at(-1), /already has an active writer/);
+});
+
+test("a late follow-up during ownership reporting stays held after a focus switch and later successful manual turn", async (t) => {
+  const f = await fixture(t);
+  await f.bridge.upsertProjectSession(phoneKey, "pc", { threadName: "main", projectPatch: { threadId: "original-native" } });
+  await f.bridge.upsertProjectSession(phoneKey, "pc", { threadName: "review", projectPatch: { threadId: "other-native" } });
+  const run = f.bridge.runPrompt({ ...request, prompt: "first" });
+  await f.calls[0].started.promise;
+  await f.select("review");
+  const sendReply = f.bridge.sendReply;
+  let lateQueued = false;
+  f.bridge.sendReply = async (jid, text) => {
+    if (!lateQueued && text.includes("Your message was not submitted")) {
+      lateQueued = true;
+      await f.bridge.queuePromptIfBusy({ ...request, projectAlias: "pc", threadName: "main", prompt: "late follow-up" });
+    }
+    await sendReply(jid, text);
+  };
+  f.calls[0].result.reject(Object.assign(new Error("Native writer ownership"), {
+    code: "ERR_CODEX_THREAD_OWNED", stage: "thread/resume", promptSubmitted: false
+  }));
+  await run;
+  assert.match(f.replies.at(-1), /original conversation has been preserved/);
+  assert.doesNotMatch(f.replies.at(-1), /still selected/);
+  assert.ok(f.replies.some((reply) => reply.includes("automatic queue delivery is held")));
+  await f.stateStore.load();
+  assert.equal(f.bridge.getProjectSession(phoneKey).threadName, "review");
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.threadId, "other-native");
+  assert.equal(f.bridge.getProjectSession(phoneKey, "pc", "main").session.queuedPrompts.length, 1);
+  assert.equal(f.bridge.getProjectSession(phoneKey, "pc", "main").session.queuedPromptsPaused, true);
+  const manual = f.bridge.runPrompt({ ...request, projectAlias: "pc", threadName: "main", prompt: "manual later message" });
+  await f.calls[1].started.promise;
+  f.calls[1].result.resolve({ threadId: "original-native", replyText: "Accepted later" });
+  await manual;
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.bridge.getProjectSession(phoneKey, "pc", "main").session.queuedPrompts.length, 1);
+  assert.equal(f.bridge.getProjectSession(phoneKey, "pc", "main").session.threadId, "original-native");
+  assert.equal(f.bridge.getProjectSession(phoneKey).session.threadId, "other-native");
 });

@@ -35,7 +35,7 @@ async function fixture(t) {
   const bridge = new WhatsAppControllerBridge({ runtime: {}, configStore, stateStore, runner });
   bridge.sendReply = async (_jid, text) => {
     replies.push(text);
-    if (/Starting a fresh|Working in|Started a one-off/.test(text)) calls.at(-1)?.started.resolve();
+    if (/Connecting to the coding tool|The coding tool accepted/.test(text)) calls.at(-1)?.started.resolve();
   };
   return { bridge, calls, replies, stateStore, configStore };
 }
@@ -47,6 +47,22 @@ test("session modifier cannot turn deny/cancel into approval", () => {
     }
   }
   assert.deepEqual(parseApprovalTargetPayload("pc/review session", "accept"), { decision: "acceptForSession", targetToken: "pc/review" });
+});
+
+test("an early non-Codex lifecycle event does not claim the provider accepted a message", async (t) => {
+  const f = await fixture(t);
+  const start = f.bridge.runner.startCodexTurn;
+  f.bridge.runner.startCodexTurn = (args) => {
+    const run = start(args);
+    queueMicrotask(() => args.onLifecycleEvent({ type: "turnStarted", threadId: "native", turnId: "initializing" }));
+    return run;
+  };
+  const running = f.bridge.runPrompt({ ...request, prompt: "hello" });
+  await f.calls[0].started.promise;
+  assert.match(f.replies.at(-1), /Connecting to the coding tool/);
+  assert.doesNotMatch(f.replies.at(-1), /accepted your message/);
+  f.calls[0].result.resolve({ threadId: "native", replyText: "Reply" });
+  await running;
 });
 
 test("malformed deny/cancel commands never grant an active native approval", async (t) => {

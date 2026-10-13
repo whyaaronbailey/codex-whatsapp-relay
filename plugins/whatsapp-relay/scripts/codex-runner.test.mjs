@@ -36,6 +36,7 @@ async function makeMockCodex(t) {
     );
     for await(const line of readline.createInterface({input:process.stdin})) {
       const message=JSON.parse(line);
+      await fs.appendFile(new URL('./mock-requests.jsonl',import.meta.url),JSON.stringify({method:message.method})+'\\n');
       const reply=result=>send({id:message.id,result});
       if(message.method==='initialized'){initialized=true;continue;}
       if(message.method==='initialize'){reply({});continue;}
@@ -51,9 +52,14 @@ async function makeMockCodex(t) {
         case 'configRequirements/read':reply({requirements:null});break;
         case 'thread/name/set':reply({});break;
         case 'thread/start':reply({thread:{id:thread,status:{type:'idle'}}});break;
-        case 'thread/resume':thread=message.params.threadId;reply({thread:{id:thread,status:{type:thread==='busy-thread'?'active':'idle'}}});break;
+        case 'thread/resume':
+          thread=message.params.threadId;
+          if(thread==='owned-thread'){send({id:message.id,error:{message:'Thread owned-thread already has an active writer'}});break;}
+          reply({thread:{id:thread,status:{type:thread==='busy-thread'?'active':'idle'}}});break;
         case 'turn/start':
-          if(message.params.input[0].text==='coalesced'){
+          if(message.params.input[0].text==='writer-during-start'){
+            send({id:message.id,error:{message:'Thread already has an active writer'}});
+          } else if(message.params.input[0].text==='coalesced'){
             send({id:message.id,result:{turn:{id:'turn-1'}}},
               {method:'item/completed',params:{turnId:'turn-1',item:{type:'agentMessage',id:'message-1',phase:'final_answer',text:'Immediate reply'}}},
               {method:'turn/completed',params:{threadId:thread,turn:{id:'turn-1',status:'completed'}}});
@@ -179,6 +185,39 @@ test("resume rejects a thread that app-server reports as active", { timeout: 500
   const run = startCodexTurn({ ...fixture, threadId: "busy-thread", prompt: "Do not start" });
   t.after(() => run.child.kill());
   await assert.rejects(run.resultPromise, /already running/);
+});
+
+test("an ownership rejection during resume is definitely unsubmitted and never calls turn/start or retries", { timeout: 5000 }, async (t) => {
+  const fixture = await makeMockCodex(t);
+  const events = [];
+  const run = startCodexTurn({ ...fixture, threadId: "owned-thread", prompt: "Do not replay", onLifecycleEvent: (event) => events.push(event) });
+  t.after(() => run.child.kill());
+  await assert.rejects(run.resultPromise, (error) => {
+    assert.equal(error.code, "ERR_CODEX_THREAD_OWNED");
+    assert.equal(error.stage, "thread/resume");
+    assert.equal(error.threadId, "owned-thread");
+    assert.equal(error.promptSubmitted, false);
+    assert.equal(error.retryable, false);
+    assert.match(error.message, /even if that client is idle/);
+    return true;
+  });
+  const methods = (await fs.readFile(path.join(fixture.workspace, "mock-requests.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).method);
+  assert.equal(methods.filter((method) => method === "thread/resume").length, 1);
+  assert.ok(!methods.includes("turn/start"));
+  assert.ok(!methods.includes("thread/start"));
+  assert.ok(!events.some((event) => event.type === "turnStarted"));
+});
+
+test("an identical writer error from turn/start is not classified as a pre-submission resume failure", { timeout: 5000 }, async (t) => {
+  const fixture = await makeMockCodex(t);
+  const run = startCodexTurn({ ...fixture, threadId: "existing", prompt: "writer-during-start" });
+  t.after(() => run.child.kill());
+  await assert.rejects(run.resultPromise, (error) => {
+    assert.match(error.message, /active writer/);
+    assert.notEqual(error.code, "ERR_CODEX_THREAD_OWNED");
+    assert.notEqual(error.promptSubmitted, false);
+    return true;
+  });
 });
 
 test("native interrupt targets the selected thread and turn", { timeout: 5000 }, async (t) => {
