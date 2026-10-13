@@ -98,3 +98,16 @@ v0.4.2
   assert.match(artifacts[README_PATH], /v0\.4\.3/);
   assert.match(artifacts[CHANGELOG_PATH], /## \[0\.4\.3\] - 2026-03-30/);
 });
+
+test("release preparation handles Windows README newlines and keeps the clone tag aligned", () => {
+  const source = [
+    "git clone --branch v0.4.3 https://github.com/whyaaronbailey/codex-whatsapp-relay.git",
+    "Install the current release tag:", "v0.4.3", "",
+    "2. If it already exists, fetch tags and check out v0.4.3 without deleting unrelated user files."
+  ].join("\r\n");
+  const updated = updateReadmeReleaseTag(source, "0.5.0");
+  assert.match(updated, /git clone --branch v0\.5\.0 /);
+  assert.match(updated, /Install the current release tag:\nv0\.5\.0/);
+  assert.match(updated, /check out v0\.5\.0 without deleting/);
+  assert.doesNotMatch(updated, /v0\.4\.3/);
+});

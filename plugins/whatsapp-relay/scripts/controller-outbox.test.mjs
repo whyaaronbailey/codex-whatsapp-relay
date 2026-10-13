@@ -22,7 +22,7 @@ test("drainControllerCommands leaves retryable failures in the outbox for the ne
       {
         type: "send_message",
         payload: {
-          chatId: "573017169679@s.whatsapp.net",
+          chatId: "10000000000@s.whatsapp.net",
           text: "hello"
         }
       },
@@ -59,7 +59,7 @@ test("drainControllerCommands quarantines non-retryable failures", async () => {
       {
         type: "send_message",
         payload: {
-          chatId: "573017169679@s.whatsapp.net",
+          chatId: "10000000000@s.whatsapp.net",
           text: "hello"
         }
       },

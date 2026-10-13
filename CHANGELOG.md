@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - Incoming documents, images and videos, caption prompts, `/files`, `/send`, and the `whatsapp_send_file` MCP tool.
 - Persistent workspace inbox/outbox snapshots and SHA-256 manifests, with a 25 MiB cap, bounded media downloads, path/link checks and credential export exclusions.
 - Host/VM configuration guide and cross-platform automated validation workflow.
+- Open-source license and attribution, contributor documentation, private security reporting guidance, and issue/PR templates.
 
 ### Fixed
 

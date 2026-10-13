@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a reproducible relay, PC/VM routing, session, or file-transfer problem.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For suspected vulnerabilities, follow [SECURITY.md](https://github.com/whyaaronbailey/codex-whatsapp-relay/blob/main/SECURITY.md) instead of posting details here.
+        Use synthetic examples. Do not upload credentials, QR codes, phone numbers, private keys, full logs, conversation transcripts, or Hindsight archives.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Revision and environment
+      description: Include commit/tag, Node and Codex versions, PC operating system, and VM operating system if applicable. Omit private usernames, hostnames, and addresses.
+      placeholder: |
+        Revision:
+        Node / Codex versions:
+        PC OS:
+        VM OS and transport, if used:
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest reproducible example, including the command or attachment type and whether the PC or VM was selected.
+      placeholder: |
+        1. Select a project using ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      placeholder: |
+        Expected:
+        Actual:
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics or tests
+      description: Optional minimal error excerpt and relevant test results. State whether this was a live WhatsApp/SSH run or an automated test. Review all content for private data before posting.

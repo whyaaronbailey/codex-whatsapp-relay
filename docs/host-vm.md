@@ -31,7 +31,7 @@ If the noninteractive SSH environment cannot locate Node or Codex, configure abs
 
 ## Configure hosts and named projects
 
-For a development checkout, register its MCP server in Codex on the gateway PC. From the repository root in PowerShell:
+Register the full release checkout's MCP server in Codex on the gateway PC. From the repository root in PowerShell:
 
 ```powershell
 $relayServer = (Resolve-Path ./plugins/whatsapp-relay/scripts/mcp-server.mjs).Path

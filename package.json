@@ -3,7 +3,16 @@
   "version": "0.4.3",
   "private": true,
   "type": "module",
-  "description": "Repo-local Codex plugin for connecting and managing WhatsApp with terminal QR auth and app-server-backed phone control.",
+  "description": "WhatsApp control of native Codex sessions on a PC and VM, with workspace file transfers.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/whyaaronbailey/codex-whatsapp-relay.git"
+  },
+  "homepage": "https://github.com/whyaaronbailey/codex-whatsapp-relay",
+  "bugs": {
+    "url": "https://github.com/whyaaronbailey/codex-whatsapp-relay/issues"
+  },
   "engines": {
     "node": ">=20"
   },

@@ -69,6 +69,7 @@ function updateJsonVersion(source, version, { includeRootPackageVersion = false 
 }
 
 export function updateReadmeReleaseTag(source, version) {
+  source = source.replace(/\r\n/g, "\n");
   const tag = `v${version}`;
   let updates = 0;
 
@@ -96,7 +97,10 @@ export function updateReadmeReleaseTag(source, version) {
     fail(`Expected to update 2 README release references, updated ${updates}.`);
   }
 
-  return updated;
+  return updated.replace(
+    /(git clone --branch )v\d+\.\d+\.\d+( https:\/\/github\.com\/whyaaronbailey\/codex-whatsapp-relay\.git)/g,
+    (_match, prefix, suffix) => `${prefix}${tag}${suffix}`
+  );
 }
 
 export function updateChangelogForRelease(source, version, date) {
