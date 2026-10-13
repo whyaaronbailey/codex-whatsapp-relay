@@ -16,7 +16,7 @@ All notable changes to this project will be documented in this file.
 
 - Windows native Codex launching, hidden controller startup, runtime-directory creation, and user-home ownership lock placement.
 - Thread/queue destination binding and concurrent project-state updates.
-- App-server initialization and coalesced turn-completion handling.
+- App-server initialization, coalesced turn-completion handling, and interruption acknowledgment races.
 - Disabled automatic outbound URL previews and removed the vulnerable optional preview dependency.
 
 Portable Windows voice support and live PC/VM WhatsApp acceptance testing remain follow-up work.

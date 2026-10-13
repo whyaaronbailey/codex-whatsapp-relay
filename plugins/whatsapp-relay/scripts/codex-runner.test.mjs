@@ -58,7 +58,15 @@ async function makeMockCodex(t) {
               {id:'approval-1',method:'item/commandExecution/requestApproval',params:{threadId:thread,turnId:'turn-1',itemId:'command-1',command:message.params.input[0].text}});
           }
           break;
-        case 'turn/interrupt':reply({});send({method:'turn/completed',params:{threadId:thread,turn:{id:'turn-1',status:'interrupted'}}});break;
+        case 'turn/interrupt':
+          if(message.params.threadId!==thread||message.params.turnId!=='turn-1'){
+            send({id:message.id,error:{message:'Incorrect interrupt target'}});break;
+          }
+          reply({});
+          // Acknowledgment and terminal notification are independent protocol
+          // messages. Keep them in separate reads to exercise the shutdown race.
+          setTimeout(()=>send({method:'turn/completed',params:{threadId:thread,turn:{id:'turn-1',status:'interrupted'}}}),50);
+          break;
         default:
           if(message.id==='approval-1'&&message.result?.decision==='accept'){
             send({method:'serverRequest/resolved',params:{threadId:thread,turnId:'turn-1',requestId:'approval-1'}});done();
@@ -127,13 +135,15 @@ test("native interrupt targets the selected thread and turn", { timeout: 5000 },
   const fixture = await makeMockCodex(t);
   let run;
   let resolveStarted;
+  const events = [];
   const started = new Promise((resolve) => { resolveStarted = resolve; });
-  run = startCodexTurn({ ...fixture, prompt: "wait", onLifecycleEvent(event) { if (event.type === "turnStarted") resolveStarted(); } });
+  run = startCodexTurn({ ...fixture, prompt: "wait", onLifecycleEvent(event) { events.push(event); if (event.type === "turnStarted") resolveStarted(); } });
   t.after(() => run.child.kill());
   const rejected = assert.rejects(run.resultPromise, /interrupted/);
   await started;
   await run.interrupt();
   await rejected;
+  assert.ok(events.some((event) => event.type === "turnCompleted" && event.status === "interrupted"));
 });
 
 test("classification uses the configured local host executable", { timeout: 5000 }, async (t) => {

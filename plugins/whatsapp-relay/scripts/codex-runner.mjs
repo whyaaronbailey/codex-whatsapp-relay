@@ -35,6 +35,7 @@ const VOICE_COMMAND_INTENT_MODEL = "gpt-5.4-mini";
 const VOICE_COMMAND_INTENT_REASONING_EFFORT = "low";
 const PROJECT_INTENT_MODEL = "gpt-5.4-mini";
 const PROJECT_INTENT_REASONING_EFFORT = "low";
+const INTERRUPT_CONFIRMATION_TIMEOUT_MS = 10_000;
 
 const VOICE_COMMAND_INTENT_SCHEMA = {
   type: "object",
@@ -1257,6 +1258,7 @@ export function startCodexTurn({
   return {
     child,
     interrupt: async () => {
+      if (settled) return;
       try {
         await bootstrap;
       } catch {
@@ -1279,7 +1281,25 @@ export function startCodexTurn({
         return;
       }
 
-      await client.shutdown();
+      // The acknowledgment only accepts the interruption request. The native
+      // app-server reports its terminal turn state in a later notification;
+      // killing it at acknowledgment races that notification on both transports.
+      let confirmationTimer;
+      let confirmed;
+      try {
+        confirmed = await Promise.race([
+          resultPromise.then(() => true, () => true),
+          new Promise((resolve) => {
+            confirmationTimer = setTimeout(() => resolve(false), INTERRUPT_CONFIRMATION_TIMEOUT_MS);
+          })
+        ]);
+      } finally {
+        clearTimeout(confirmationTimer);
+      }
+      if (!confirmed) {
+        settle("reject", new Error("Codex did not confirm interruption within 10 seconds; stopping its relay connection."));
+      }
+      await client.shutdown(confirmed ? "SIGTERM" : "SIGKILL");
     },
     answerApproval: async (requestId, decision) => {
       await bootstrap;
