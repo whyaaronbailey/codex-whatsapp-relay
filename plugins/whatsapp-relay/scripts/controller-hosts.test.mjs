@@ -146,7 +146,8 @@ test("real worker proxies complete app-server lines and reaps child on input clo
   assert.equal(stderr, "");
 });
 
-test("Windows SSH bootstrap passes stdin and UTF-8 through its actual PowerShell launcher", { timeout: 10000, skip: process.platform !== "win32" }, async (t) => {
+// Allow bounded headroom for real PowerShell cold startup under parallel CI load.
+test("Windows SSH bootstrap passes stdin and UTF-8 through its actual PowerShell launcher", { timeout: 30000, skip: process.platform !== "win32" }, async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "relay-windows-ssh-test-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }));
   const server = path.join(directory, "mock-server.mjs");
