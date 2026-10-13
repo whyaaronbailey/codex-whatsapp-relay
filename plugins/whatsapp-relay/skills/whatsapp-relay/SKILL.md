@@ -33,8 +33,10 @@ Use this skill when the user wants to connect WhatsApp, inspect recent chats, re
    - send voice notes that are transcribed locally before continuing the current Codex session
    - receive outbound WhatsApp voice-note replies when voice reply mode is enabled for that chat
    - send `/new` or `/n` to start fresh
-   - send `/sessions` or `/ls` to list recent Codex threads
-   - send `/1`, `/2`, ... or `/session <number|thread-id-prefix>` or `/c <number|thread-id-prefix>` to switch this chat to another Codex session
+   - send `/hosts` and `/host <id>` to select the PC or VM
+   - send `/sessions` or `/ls` to browse native conversations across directories for the selected computer's configured coding tools; `/sessions more` shows another page
+   - send `/1`, `/2`, ... or `/session <number>` to select a listed conversation and automatically use its directory and coding tool
+   - send `/dir` to inspect the current directory/filter, `/dirs` to list shortcuts, `/dir <absolute path or shortcut>` to narrow discovery, or `/dir all` to clear the filter
    - send `/status` or `/st` to inspect the active session
    - send `/permissions` or `/p` to inspect the current permission level
    - send `/voice` to inspect or change outbound voice-reply mode for that chat
@@ -44,6 +46,7 @@ Use this skill when the user wants to connect WhatsApp, inspect recent chats, re
    - send `/help` or `/h` to see command help
 
    The bridge uses `codex app-server` under the hood so each allowed number maps to a native Codex thread that can be resumed across messages.
+   Host-wide discovery includes saved conversations, not just currently running work. Do not equate saved metadata or a fresh app-server's unloaded state with desktop activity. The configuration retains legacy `projects` fields and `/project` aliases, but explain the user flow as computers, directories and sessions.
    `workspace-write` is the safe default because guarded command and file-change approvals can be answered from WhatsApp.
    `danger-full-access` requires an explicit confirmation code from the chat before the bridge disables sandboxing for that session.
    Voice notes are transcribed locally with Parakeet v3 via `uvx` and `ffmpeg`, and short low-confidence transcripts are rejected so the chat can retry instead of sending a bad prompt to Codex.

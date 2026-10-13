@@ -118,6 +118,9 @@ export function defaultChatSession(phoneKey = null) {
     label: null,
     remoteJid: null,
     activeProject: DEFAULT_PROJECT_ALIAS,
+    directoryFilter: null,
+    browserRevision: 0,
+    hostSessionBrowser: null,
     voiceReply: null,
     projects: {
       [DEFAULT_PROJECT_ALIAS]: defaultProjectSession()

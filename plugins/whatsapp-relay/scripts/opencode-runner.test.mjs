@@ -52,6 +52,118 @@ test("OpenCode v2 lists only this workspace and normalizes native session metada
   assert.ok(requests.every((request) => request.method === "GET"));
 });
 
+test("OpenCode explicit workspace scope matches the default and retains the project alias", async () => {
+  const results = [];
+  for (const scope of [undefined, "workspace", "project"]) {
+    const { options, requests } = fixture({ "GET /api/session": () => ({ data: [session, { ...session, id: "ses_other", location: { directory: "C:\\Other" } }] }) });
+    results.push(await listOpenCodeThreads({ ...options, scope }));
+    assert.equal(requests.find((item) => item.path === "/api/session").search.get("directory"), workspace);
+  }
+  assert.deepEqual(results[1], results[0]);
+  assert.deepEqual(results[2], results[0]);
+  assert.equal(results[0].length, 1);
+});
+
+test("OpenCode v2 host discovery follows native cursors across directories with actual metadata", async () => {
+  const other = { ...session, id: "ses_other", title: "Other project", location: { directory: "/home/user/other" }, time: { created: 3000, updated: 4000 } };
+  const { options, requests } = fixture({
+    "GET /api/session": (call) => call.search.has("cursor")
+      ? { data: [session, other], cursor: {} }
+      : { data: [session, { ...session, id: "ses_archived", time: { archived: 5000 } },
+        { ...session, id: "ses_relative", location: { directory: "relative/path" } },
+        { ...session, id: "ses_drive_relative", location: { directory: "C:relative" } },
+        { ...session, id: "ses_root_relative", location: { directory: "\\relative" } },
+        { ...session, id: "ses_newline", location: { directory: "C:\\Other\nfolder" } },
+        { ...session, id: "ses_delete", location: { directory: "/home/user/\u007ffolder" } },
+        { ...session, id: "ses_missing", location: {} }, { ...session, id: "not-a-native-id" }], cursor: { next: "opaque next+page" } },
+    "GET /api/session/active": () => ({ data: { [other.id]: { type: "running" } } })
+  });
+  const result = await listOpenCodeThreads({ ...options, scope: "host", limit: 3 });
+  assert.equal(result.length, 2);
+  assert.deepEqual(result.map((item) => item.cwd), [workspace, other.location.directory]);
+  assert.equal(result[1].name, other.title);
+  assert.equal(result[1].updatedAt, 4);
+  assert.deepEqual(result.map((item) => item.status.type), ["idle", "active"]);
+  const pages = requests.filter((item) => item.path === "/api/session");
+  assert.equal(pages.length, 2);
+  assert.equal(pages[0].search.get("order"), "desc");
+  assert.equal(pages[1].search.get("cursor"), "opaque next+page");
+  assert.equal(pages[1].search.has("order"), false);
+  assert.ok(requests.every((item) => item.method === "GET" && !item.search.has("directory") && !item.search.has("project")));
+});
+
+test("OpenCode workspace discovery rejects control characters and Windows root-relative metadata", async () => {
+  for (const directory of ["C:\\Other\tFolder", "\\relative"]) {
+    const { options } = fixture({ "GET /api/session": () => ({ data: [{ ...session, location: { directory } }] }) });
+    assert.deepEqual(await listOpenCodeThreads({ ...options, workspace: directory, scope: "workspace" }), []);
+  }
+});
+
+test("OpenCode host discovery caps results at 200 across bounded pages", async () => {
+  let page = 0;
+  const { options, requests } = fixture({
+    "GET /api/session": () => ({
+      data: Array.from({ length: 100 }, (_, index) => ({ ...session, id: `ses_${page * 100 + index}` })),
+      cursor: { next: `page-${++page}` }
+    })
+  });
+  const result = await listOpenCodeThreads({ ...options, scope: "host", limit: 1000 });
+  assert.equal(result.length, 200);
+  const pages = requests.filter((item) => item.path === "/api/session");
+  assert.equal(pages.length, 2);
+  assert.equal(pages[0].search.get("limit"), "200");
+  assert.equal(pages[1].search.get("limit"), "100");
+});
+
+test("OpenCode host discovery rejects repeated and unbounded pagination", async () => {
+  for (const repeating of [true, false]) {
+    let pages = 0;
+    const { options } = fixture({
+      "GET /api/session": () => ({ data: [session], cursor: { next: repeating ? "again" : `page-${++pages}` } })
+    });
+    await assert.rejects(listOpenCodeThreads({ ...options, scope: "host", limit: 3 }), repeating ? /repeated a cursor/ : /exceeded 10 pages/);
+    if (!repeating) assert.equal(pages, 10);
+  }
+});
+
+test("OpenCode host discovery rejects malformed pages and cursors", async () => {
+  for (const response of [
+    { data: {}, cursor: {} },
+    { data: [session], cursor: { next: 12 } },
+    { data: Array.from({ length: 201 }, () => session), cursor: {} }
+  ]) {
+    const { options } = fixture({ "GET /api/session": () => response });
+    await assert.rejects(listOpenCodeThreads({ ...options, scope: "host" }), /invalid host sessions|invalid host session cursor|exceeds the relay discovery limit/);
+  }
+});
+
+test("OpenCode v1 host discovery uses the global route and its cursor, without guessing idle status", async () => {
+  const { options, requests } = fixture({
+    "GET /global/health": () => ({ healthy: true, version: "1.2.27" }),
+    "GET /experimental/session": (call) => call.search.has("cursor")
+      ? Response.json([{ id: "ses_elsewhere", title: "Elsewhere", directory: "D:\\Work", time: { updated: 1000 } }])
+      : Response.json([{ id: session.id, title: session.title, directory: workspace, time: session.time }], { headers: { "x-next-cursor": "2000" } })
+  });
+  const result = await listOpenCodeThreads({ ...options, opencodeApiVersion: "v1", scope: "host", limit: 3 });
+  assert.deepEqual(result.map((item) => item.cwd), [workspace, "D:\\Work"]);
+  assert.ok(result.every((item) => !Object.hasOwn(item, "status")));
+  const pages = requests.filter((item) => item.path === "/experimental/session");
+  assert.equal(pages[1].search.get("cursor"), "2000");
+  assert.ok(requests.every((item) => item.method === "GET" && !item.search.has("directory")));
+  assert.ok(!requests.some((item) => item.path === "/session" || item.path === "/session/status"));
+});
+
+test("OpenCode host discovery reports an unsupported global endpoint and never falls back to project results", async () => {
+  for (const response of [new Response(null, { status: 404 }), new Response("<html>UI</html>", { headers: { "content-type": "text/html" } })]) {
+    const { options, requests } = fixture({
+      "GET /global/health": () => ({ healthy: true, version: "1.0.1" }),
+      "GET /experimental/session": () => response
+    });
+    await assert.rejects(listOpenCodeThreads({ ...options, opencodeApiVersion: "v1", scope: "host" }), /does not expose the native host-wide session list/);
+    assert.ok(!requests.some((item) => item.path === "/session"));
+  }
+});
+
 test("OpenCode preserves existing policies and identifies its exact native prompt", async () => {
   const { options, requests } = fixture();
   const events = [];

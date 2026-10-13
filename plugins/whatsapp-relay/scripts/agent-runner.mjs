@@ -17,7 +17,7 @@ export function agentEngine(options = {}) {
 // Only configuration needed by a provider crosses the SSH boundary. Never send
 // the gateway's process environment, WhatsApp identity, or credentials to a VM.
 export function serializableAgentOptions(options = {}) {
-  const fields = ["engine", "workspace", "prompt", "threadId", "threadName", "model", "profile", "search", "permissionLevel", "limit", "codexBin", "claudeBin", "opencodeUrl", "opencodeApiVersion", "opencodeUsernameEnv", "opencodePasswordEnv"];
+  const fields = ["engine", "workspace", "scope", "prompt", "threadId", "threadName", "model", "profile", "search", "permissionLevel", "limit", "codexBin", "claudeBin", "opencodeUrl", "opencodeApiVersion", "opencodeUsernameEnv", "opencodePasswordEnv"];
   const result = {};
   for (const field of fields) if (options[field] !== undefined) result[field] = options[field];
   result.engine = agentEngine(options);

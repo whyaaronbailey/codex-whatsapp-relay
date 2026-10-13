@@ -166,7 +166,7 @@ test("native session list and connect capture their slot across slow provider ca
   await f.select("build");
   const listing = deferred();
   f.bridge.runner.listCodexThreads = () => listing.promise;
-  const list = f.bridge.sendThreadList(phoneKey, request.remoteJid);
+  const list = f.bridge.sendThreadList(phoneKey, request.remoteJid, "pc/build");
   await f.select("review");
   listing.resolve([{ id: "chosen", name: "Chosen native" }]); await list;
   assert.match(f.replies.at(-1), /\/session pc\/build 1/);
