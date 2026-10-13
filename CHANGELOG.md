@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Host and VM project routing through one WhatsApp gateway and on-demand SSH workers, preserving each machine's native Codex environment and memory configuration.
+- `/hosts` and `/host` selection, host-specific native session listing/resumption, and new-session control.
+- Incoming documents, images and videos, caption prompts, `/files`, `/send`, and the `whatsapp_send_file` MCP tool.
+- Persistent workspace inbox/outbox snapshots and SHA-256 manifests, with a 25 MiB cap, bounded media downloads, path/link checks and credential export exclusions.
+- Host/VM configuration guide and cross-platform automated validation workflow.
+
+### Fixed
+
+- Windows native Codex launching, hidden controller startup, runtime-directory creation, and user-home ownership lock placement.
+- Thread/queue destination binding and concurrent project-state updates.
+- App-server initialization and coalesced turn-completion handling.
+- Disabled automatic outbound URL previews and removed the vulnerable optional preview dependency.
+
+Portable Windows voice support and live PC/VM WhatsApp acceptance testing remain follow-up work.
+
 ## [0.4.3] - 2026-03-30
 
 ### Fixed

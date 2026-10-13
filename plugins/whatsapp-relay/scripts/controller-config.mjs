@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { defaultProjectConfig, normalizeConfiguredProjects } from "./controller-projects.mjs";
+import { normalizeConfiguredHosts } from "./controller-hosts.mjs";
 import { resolvePermissionLevel } from "./controller-permissions.mjs";
 import { authDir, controllerConfigFile, repoRoot } from "./paths.mjs";
 import { normalizeTtsProvider } from "./voice-replier.mjs";
@@ -89,7 +90,9 @@ function defaultConfig() {
     enabled: false,
     workspace: repoRoot,
     defaultProject: defaultProjectConfig().alias,
+    hosts: [{ id: "host", transport: "local" }],
     projects: [],
+    maxAttachmentBytes: 25 * 1024 * 1024,
     codexBin: "codex",
     model: null,
     profile: null,
@@ -109,6 +112,11 @@ function normalizeConfig(config = {}) {
   };
 
   delete merged.fullAuto;
+  merged.hosts = normalizeConfiguredHosts(merged);
+  if (!Number.isSafeInteger(merged.maxAttachmentBytes) ||
+      merged.maxAttachmentBytes <= 0 || merged.maxAttachmentBytes > 25 * 1024 * 1024) {
+    throw new Error("maxAttachmentBytes must be a positive integer no larger than 25 MiB.");
+  }
   merged.permissionLevel = resolvePermissionLevel(merged.permissionLevel);
   merged.ttsProvider = normalizeTtsProvider(merged.ttsProvider, "chatterbox-turbo");
   merged.ttsChatterboxAllowNonEnglish = normalizeBooleanish(

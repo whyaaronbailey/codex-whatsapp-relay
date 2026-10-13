@@ -34,6 +34,8 @@ function normalizeQueuedPrompt(value = {}) {
     prompt,
     forceNewThread: Boolean(value.forceNewThread),
     queuedAt: typeof value.queuedAt === "string" ? value.queuedAt : null,
+    projectAlias: typeof value.projectAlias === "string" ? value.projectAlias : null,
+    bindingKey: typeof value.bindingKey === "string" ? value.bindingKey : null,
     voiceReplyOverride:
       value.voiceReplyOverride?.enabled
         ? {
@@ -53,6 +55,7 @@ function normalizeQueuedPromptList(value) {
 export function defaultProjectSession() {
   return {
     threadId: null,
+    bindingKey: null,
     permissionLevel: null,
     pendingPermissionConfirmation: null,
     pendingApproval: null,
@@ -262,6 +265,18 @@ export class ControllerStateStore {
       };
       this.data = normalizeState(data);
     });
+  }
+
+  // Compute updates only after earlier writes have completed. Callers must not
+  // construct whole-session snapshots before joining this queue.
+  async mutateSession(phoneKey, mutator) {
+    let result;
+    await this.mutate(async (data) => {
+      const session = normalizeChatSession(data.sessions[phoneKey] ?? {}, phoneKey);
+      result = await mutator(session);
+      data.sessions[phoneKey] = normalizeChatSession(session, phoneKey);
+    });
+    return result;
   }
 
   async removeSession(phoneKey) {

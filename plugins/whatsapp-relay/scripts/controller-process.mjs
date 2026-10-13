@@ -9,6 +9,7 @@ import { ControllerStateStore } from "./controller-state.mjs";
 import {
   controllerDaemonScript,
   controllerLogFile,
+  ensureRuntimeDirs,
   repoRoot
 } from "./paths.mjs";
 
@@ -52,35 +53,51 @@ export async function getControllerProcessStatus() {
   };
 }
 
-export async function startControllerDaemon() {
-  const current = await getControllerProcessStatus();
+export async function startControllerDaemon({
+  ensureDirs = ensureRuntimeDirs,
+  getStatus = getControllerProcessStatus,
+  getOwner = getGlobalControllerOwner,
+  loadConfig = () => new ControllerConfigStore().load(),
+  openLog = () => fs.open(controllerLogFile, "a"),
+  spawnImpl = spawn,
+  wait = delay
+} = {}) {
+  await ensureDirs();
+  const current = await getStatus();
   if (current.running) {
     return current;
   }
 
-  const globalOwner = await getGlobalControllerOwner();
+  const globalOwner = await getOwner();
   if (globalOwner && globalOwner.pid !== current.pid) {
     throw new Error(
       `WhatsApp controller is already running from ${globalOwner.repoRoot} (pid ${globalOwner.pid}). Stop that bridge before starting another checkout.`
     );
   }
 
-  const configStore = new ControllerConfigStore();
-  const config = await configStore.load();
-  const logHandle = await fs.open(controllerLogFile, "a");
-  const child = spawn(process.execPath, [controllerDaemonScript], {
-    cwd: repoRoot,
-    detached: true,
-    env: controllerDaemonEnv(config),
-    stdio: ["ignore", logHandle.fd, logHandle.fd]
-  });
-
-  child.unref();
-  await logHandle.close();
+  const config = await loadConfig();
+  const logHandle = await openLog();
+  let child;
+  let startupError = null;
+  try {
+    child = spawnImpl(process.execPath, [controllerDaemonScript], {
+      cwd: repoRoot,
+      detached: true,
+      windowsHide: true,
+      env: controllerDaemonEnv(config),
+      stdio: ["ignore", logHandle.fd, logHandle.fd]
+    });
+    child.once("error", (error) => { startupError = error; });
+    child.unref();
+  } finally {
+    await logHandle.close();
+  }
 
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    await delay(250);
-    const status = await getControllerProcessStatus();
+    if (startupError) throw startupError;
+    await wait(250);
+    if (startupError) throw startupError;
+    const status = await getStatus();
     if (status.running && status.pid === child.pid) {
       return status;
     }

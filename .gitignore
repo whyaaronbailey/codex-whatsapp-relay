@@ -1,4 +1,5 @@
 node_modules/
+.whatsapp-relay/
 plugins/whatsapp-relay/.venv-chatterbox/
 
 plugins/whatsapp-relay/data/auth*/

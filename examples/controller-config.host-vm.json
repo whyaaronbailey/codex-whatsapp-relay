@@ -1,0 +1,38 @@
+{
+  "enabled": false,
+  "defaultProject": "pc-work",
+  "codexBin": "codex",
+  "permissionLevel": "workspace-write",
+  "captureAllDirectMessages": true,
+  "maxAttachmentBytes": 26214400,
+  "hosts": [
+    {
+      "id": "host",
+      "label": "Main PC",
+      "transport": "local"
+    },
+    {
+      "id": "vm",
+      "label": "Virtual machine",
+      "transport": "ssh",
+      "target": "relay-vm",
+      "platform": "win32",
+      "nodeBin": "node",
+      "codexBin": "codex",
+      "workerPath": "C:\\Relay\\codex-whatsapp-relay\\plugins\\whatsapp-relay\\scripts\\relay-worker.mjs"
+    }
+  ],
+  "projects": [
+    {
+      "alias": "pc-work",
+      "host": "host",
+      "workspace": "C:\\Projects\\example"
+    },
+    {
+      "alias": "vm-work",
+      "host": "vm",
+      "workspace": "C:\\Projects\\example"
+    }
+  ],
+  "allowedControllers": []
+}

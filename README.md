@@ -1,5 +1,23 @@
 # Codex WhatsApp Relay
 
+This fork adds one WhatsApp gateway for Codex on a PC and a VM, with project-specific session routing and bidirectional file transfers. Based on [Adolfo Builes' original relay](https://github.com/abuiles/codex-whatsapp-relay).
+
+**Development status:** host/VM and attachment support is on `feat/host-vm-files`. The inherited `v0.4.3` tag does not include these changes. Automated tests cover the bridge and worker; live WhatsApp pairing and VM deployment must still be verified on your machines. Portable Windows voice dictation is deferred.
+
+Start with [the host/VM setup guide](docs/host-vm.md) and [example configuration](examples/controller-config.host-vm.json). This uses each machine's existing Codex account, instructions and Hindsight connection, with no additional agent framework or memory store.
+
+```powershell
+git clone --branch feat/host-vm-files https://github.com/whyaaronbailey/codex-whatsapp-relay.git
+cd codex-whatsapp-relay
+npm ci
+npm run check
+npm test
+```
+
+For an existing checkout, fetch and select that branch after preserving local changes. Run one linked WhatsApp gateway on the PC and the same worker revision on the VM. Use `/hosts`, `/host vm <project>`, `/sessions`, `/new`, `/files` and `/send <relative path>`. Documents, images and videos save into the selected workspace's `.whatsapp-relay/inbox`; exports get persistent outbox snapshots and hash manifests. Transfers are limited to 25 MiB each.
+
+The rest of this README documents the inherited relay features. Voice instructions describe the upstream platform-specific implementation, not validated Windows voice support.
+
 Put Codex in your WhatsApp.
 
 WhatsApp Relay is a Codex plugin that links a local WhatsApp account to Codex, lets Codex read and send WhatsApp messages, and can optionally let you control Codex from an allowed direct chat.
@@ -20,7 +38,9 @@ The controller bridge is now project-aware. One chat can keep `api` busy, switch
 - talk to Codex with voice notes and get local voice-note replies back
 - resume the same work later in your terminal with `codex resume`
 
-## Install In Codex
+## Install The Legacy Release In Codex
+
+This tagged-release flow installs the original feature set. For this fork's host/VM and file support, use the development branch and setup guide above until a new release is published.
 
 Paste this prompt into Codex:
 
@@ -28,7 +48,7 @@ Paste this prompt into Codex:
 Install the WhatsApp Relay plugin globally for my user account.
 
 Use this repository as the source:
-https://github.com/abuiles/codex-whatsapp-relay
+https://github.com/whyaaronbailey/codex-whatsapp-relay
 
 Install the current release tag:
 v0.4.3

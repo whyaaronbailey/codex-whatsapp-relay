@@ -2,13 +2,13 @@
   "name": "whatsapp-relay",
   "version": "0.4.3",
   "description": "Link a local WhatsApp account to Codex, manage chats, and control Codex from allowed WhatsApp numbers.",
-  "install_url": "https://raw.githubusercontent.com/abuiles/codex-whatsapp-relay/refs/heads/main/plugins/whatsapp-relay/.codex-plugin/plugin.json",
+  "install_url": "https://raw.githubusercontent.com/whyaaronbailey/codex-whatsapp-relay/refs/heads/main/plugins/whatsapp-relay/.codex-plugin/plugin.json",
   "author": {
     "name": "Adolfo Builes",
     "url": "https://github.com/abuiles"
   },
-  "homepage": "https://github.com/abuiles/codex-whatsapp-relay",
-  "repository": "https://github.com/abuiles/codex-whatsapp-relay",
+  "homepage": "https://github.com/whyaaronbailey/codex-whatsapp-relay",
+  "repository": "https://github.com/whyaaronbailey/codex-whatsapp-relay",
   "license": "MIT",
   "keywords": [
     "whatsapp",
@@ -29,7 +29,7 @@
       "Interactive",
       "Write"
     ],
-    "websiteURL": "https://github.com/abuiles/codex-whatsapp-relay-plugin",
+    "websiteURL": "https://github.com/whyaaronbailey/codex-whatsapp-relay",
     "privacyPolicyURL": "https://www.whatsapp.com/legal/privacy-policy",
     "termsOfServiceURL": "https://www.whatsapp.com/legal/terms-of-service",
     "defaultPrompt": [

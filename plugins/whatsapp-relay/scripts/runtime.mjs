@@ -15,6 +15,7 @@ import pino from "pino";
 
 import { authDir, credsFile, ensureRuntimeDirs, runtimeFile, storeFile } from "./paths.mjs";
 import { WhatsAppStore } from "./store.mjs";
+import { downloadBoundedMedia } from "./relay-media.mjs";
 
 const require = createRequire(import.meta.url);
 const QRCode = require("qrcode-terminal/vendor/QRCode");
@@ -368,12 +369,12 @@ export class WhatsAppRuntime {
     return this.waitForConnection(timeoutMs);
   }
 
-  async downloadMediaBuffer(message) {
+  async downloadMediaBuffer(message, options = {}) {
     const socket = await this.ensureConnected();
-    return downloadMediaMessage(message, "buffer", {}, {
+    return downloadBoundedMedia(() => downloadMediaMessage(message, "stream", {}, {
       logger: this.logger,
       reuploadRequest: socket.updateMediaMessage
-    });
+    }), options);
   }
 
   async startAuthFlow(timeoutMs = 20_000) {

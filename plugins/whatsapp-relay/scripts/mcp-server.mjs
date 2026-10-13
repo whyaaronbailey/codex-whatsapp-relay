@@ -1,26 +1,34 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { pathToFileURL } from "node:url";
 
 import { ControllerConfigStore } from "./controller-config.mjs";
+import { projectBindingKey } from "./controller-bridge.mjs";
 import {
   normalizePermissionLevel,
   resolvePermissionLevel
 } from "./controller-permissions.mjs";
-import { enqueueControllerCommand } from "./controller-outbox.mjs";
+import { enqueueControllerCommand as defaultEnqueueControllerCommand } from "./controller-outbox.mjs";
 import {
-  getControllerProcessStatus,
-  startControllerDaemon,
-  stopControllerDaemon
+  getControllerProcessStatus as defaultGetControllerProcessStatus,
+  startControllerDaemon as defaultStartControllerDaemon,
+  stopControllerDaemon as defaultStopControllerDaemon
 } from "./controller-process.mjs";
+import { resolveHost } from "./controller-hosts.mjs";
+import { MAX_ATTACHMENT_BYTES } from "./relay-files.mjs";
 import { credsFile, storeFile } from "./paths.mjs";
 import { WhatsAppRuntime } from "./runtime.mjs";
 import { normalizeTtsProvider } from "./voice-replier.mjs";
 
-const runtime = new WhatsAppRuntime({
-  logLevel: process.env.WHATSAPP_LOG_LEVEL ?? "warn"
-});
-const controllerConfigStore = new ControllerConfigStore();
+export async function createWhatsAppMcpServer({
+  runtime = new WhatsAppRuntime({ logLevel: process.env.WHATSAPP_LOG_LEVEL ?? "warn" }),
+  controllerConfigStore = new ControllerConfigStore(),
+  getControllerProcessStatus = defaultGetControllerProcessStatus,
+  startControllerDaemon = defaultStartControllerDaemon,
+  stopControllerDaemon = defaultStopControllerDaemon,
+  enqueueControllerCommand = defaultEnqueueControllerCommand
+} = {}) {
 
 await runtime.initialize();
 
@@ -101,7 +109,9 @@ function controllerSummaryLines(config, processStatus) {
     `tts_provider: ${config.ttsProvider}`,
     `tts_chatterbox_allow_non_english: ${config.ttsChatterboxAllowNonEnglish ? "yes" : "no"}`,
     `allowed_controller_count: ${config.allowedControllers.length}`,
-    `project_count: ${config.projects.length}`
+    `project_count: ${config.projects.length}`,
+    `host_count: ${config.hosts.length}`,
+    `max_attachment_bytes: ${config.maxAttachmentBytes}`
   ];
 
   if (config.profile) {
@@ -134,12 +144,19 @@ function controllerSummaryLines(config, processStatus) {
     }
   }
 
+  if (config.hosts.length) {
+    lines.push("", "hosts:");
+    for (const host of config.hosts) {
+      lines.push(`- ${host.id}${host.label ? ` (${host.label})` : ""} transport=${host.transport} platform=${host.platform}`);
+    }
+  }
+
   if (config.projects.length) {
     lines.push("");
     lines.push("projects:");
     for (const project of config.projects) {
       lines.push(
-        `- ${project.alias}${project.alias === config.defaultProject ? " (default)" : ""} workspace=${project.workspace}`
+        `- ${project.alias}${project.alias === config.defaultProject ? " (default)" : ""} host=${project.host ?? "host"} workspace=${project.workspace}`
       );
     }
   }
@@ -148,12 +165,13 @@ function controllerSummaryLines(config, processStatus) {
     lines.push("");
     lines.push("sessions:");
     for (const session of processStatus.sessions) {
+      const project = config.projects.find((entry) => entry.alias === (session.activeProject ?? config.defaultProject));
       lines.push(
         `- ${session.label ? `${session.label} ` : ""}${session.phoneKey} active_project=${
           session.activeProject ?? config.defaultProject
         } thread=${
           session.threadId ? session.threadId.slice(0, 8) : "none"
-        } permissions=${session.permissionLevel ?? config.permissionLevel}`
+        } host=${project?.host ?? "host"} permissions=${session.permissionLevel ?? config.permissionLevel}`
       );
     }
   }
@@ -340,10 +358,22 @@ server.tool(
   {
     workspace: z.string().min(1).optional(),
     defaultProject: z.string().min(1).optional(),
+    hosts: z.array(z.object({
+      id: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/),
+      label: z.string().min(1).optional(),
+      transport: z.enum(["local", "ssh"]).optional(),
+      platform: z.enum(["win32", "linux", "darwin", "windows", "posix"]).optional(),
+      codexBin: z.string().min(1).optional(),
+      target: z.string().min(1).optional(),
+      workerPath: z.string().min(1).optional(),
+      nodeBin: z.string().min(1).optional()
+    })).optional(),
+    maxAttachmentBytes: z.number().int().min(1).max(MAX_ATTACHMENT_BYTES).optional(),
     projects: z
       .array(
         z.object({
           alias: z.string().min(1).optional(),
+          host: z.string().min(1).optional(),
           workspace: z.string().min(1),
           model: z.string().min(1).optional(),
           profile: z.string().min(1).optional(),
@@ -364,6 +394,8 @@ server.tool(
   async ({
     workspace,
     defaultProject,
+    hosts,
+    maxAttachmentBytes,
     projects,
     model,
     profile,
@@ -394,6 +426,8 @@ server.tool(
         enabled: true,
         ...(workspace ? { workspace } : {}),
         ...(defaultProject ? { defaultProject } : {}),
+        ...(hosts !== undefined ? { hosts } : {}),
+        ...(maxAttachmentBytes !== undefined ? { maxAttachmentBytes } : {}),
         ...(projects ? { projects } : {}),
         ...(model ? { model } : {}),
         ...(profile ? { profile } : {}),
@@ -423,7 +457,7 @@ server.tool(
           ...controllerSummaryLines(config, processStatus),
           "",
           "Allowed direct chats can now send plain text to continue their Codex session.",
-          "Bridge commands: /projects, /project <n|alias|hint>, /in, /btw, /n, /st, /ls, /1 or /session, /p, /a, /d, /q, /x, /h"
+          "Bridge commands: /hosts, /host <id>, /projects, /project <n|alias|hint>, /files, /send <relative-path>, /in, /btw, /n, /st, /ls, /1 or /session, /p, /a, /d, /q, /x, /h"
         ].join("\n")
       );
     } catch (error) {
@@ -567,7 +601,7 @@ server.tool(
       }
 
       const socket = await runtime.ensureConnected();
-      await socket.sendMessage(chat.id, { text });
+      await socket.sendMessage(chat.id, { text, linkPreview: null });
       return textResult(`Sent message to ${chat.displayName} (${chat.id}).`);
     } catch (error) {
       return textResult(error.message, { isError: true });
@@ -575,5 +609,43 @@ server.tool(
   }
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+server.tool(
+  "whatsapp_send_file",
+  "Queue a workspace file for WhatsApp delivery through the running controller bridge. Requires an exact configured project alias and a relative path; files are checked and stored by that project's host before sending.",
+  {
+    chatId: z.string().min(1).optional(),
+    chatName: z.string().min(1).optional(),
+    projectAlias: z.string().min(1),
+    relativePath: z.string().min(1).max(2048)
+  },
+  async ({ chatId, chatName, projectAlias, relativePath }) => {
+    try {
+      const bridgeState = await getBridgeState();
+      if (!bridgeState.ownsLiveSession) {
+        throw new Error("File delivery requires a running controller bridge. Start it before queuing files.");
+      }
+      const project = bridgeState.config.projects.find((entry) => entry.alias === projectAlias);
+      if (!project) throw new Error(`Unknown project alias: ${projectAlias}. Use an exact alias from whatsapp_controller_status.`);
+      const host = resolveHost(bridgeState.config, project.host ?? "host");
+      const chat = resolveChatOrError({ chatId, chatName });
+      const command = await enqueueControllerCommand({
+        type: "send_file",
+        payload: {
+          chatId: chat.id, projectAlias: project.alias, relativePath, hostId: host.id,
+          bindingKey: projectBindingKey(bridgeState.config, project)
+        }
+      });
+      return textResult(`Queued file ${relativePath} from project ${project.alias} on host ${host.id} to ${chat.displayName} (${chat.id}). Delivery is pending controller processing. Transfer command: ${command.id}.`);
+    } catch (error) {
+      return textResult(error.message, { isError: true });
+    }
+  }
+);
+
+return server;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const server = await createWhatsAppMcpServer();
+  await server.connect(new StdioServerTransport());
+}

@@ -10,6 +10,7 @@ import {
   normalizeConfiguredProjects,
   normalizeProjectAlias,
   resolveConfiguredProject,
+  resolveConfiguredProjectSelection,
   resolveExplicitConfiguredProject,
   resolveProjectReference,
   sanitizeProjectSpec
@@ -22,10 +23,11 @@ test("normalizeConfiguredProjects migrates a legacy single-workspace config", ()
   });
 
   assert.equal(normalized.defaultProject, "main");
-  assert.equal(normalized.workspace, "/tmp/example");
+  assert.equal(normalized.workspace, path.resolve("/tmp/example"));
   assert.equal(normalized.projects.length, 1);
   assert.equal(normalized.projects[0].alias, "main");
-  assert.equal(normalized.projects[0].workspace, "/tmp/example");
+  assert.equal(normalized.projects[0].workspace, path.resolve("/tmp/example"));
+  assert.equal(normalized.projects[0].host, "host");
 });
 
 test("normalizeConfiguredProjects collapses duplicate workspaces down to one project", () => {
@@ -39,7 +41,7 @@ test("normalizeConfiguredProjects collapses duplicate workspaces down to one pro
 
   assert.equal(normalized.projects.length, 1);
   assert.equal(normalized.projects[0].alias, "retail-dashboard");
-  assert.equal(normalized.projects[0].workspace, "/tmp/retail-dashboard");
+  assert.equal(normalized.projects[0].workspace, path.resolve("/tmp/retail-dashboard"));
 });
 
 test("resolveConfiguredProject finds aliases and workspace basenames", () => {
@@ -51,8 +53,8 @@ test("resolveConfiguredProject finds aliases and workspace basenames", () => {
     ]
   };
 
-  assert.equal(resolveConfiguredProject(config, "alpha-app")?.workspace, "/tmp/alpha-app");
-  assert.equal(resolveConfiguredProject(config, "alpha app")?.workspace, "/tmp/alpha-app");
+  assert.equal(resolveConfiguredProject(config, "alpha-app")?.workspace, path.resolve("/tmp/alpha-app"));
+  assert.equal(resolveConfiguredProject(config, "alpha app")?.workspace, path.resolve("/tmp/alpha-app"));
 });
 
 test("findConfiguredProject resolves unique prefixes and existing workspaces", () => {
@@ -216,4 +218,125 @@ test("sanitizeProjectSpec strips invisible characters and unwraps markdown links
     sanitizeProjectSpec("\u2060[retail-dashboard](/tmp/retail-dashboard)"),
     "/tmp/retail-dashboard"
   );
+});
+
+function remoteHost(id = "vm", platform = "linux") {
+  return {
+    id,
+    transport: "ssh",
+    target: "user@relay-vm",
+    workerPath: platform === "win32" ? "C:\\relay\\worker.mjs" : "/opt/relay/worker.mjs",
+    platform
+  };
+}
+
+test("remote POSIX and Windows workspaces preserve their own path semantics", () => {
+  const config = normalizeConfiguredProjects({
+    hosts: [remoteHost(), remoteHost("win-vm", "win32")],
+    projects: [
+      { alias: "linux", host: "vm", workspace: "/home/user/My Project" },
+      { alias: "windows", host: "win-vm", workspace: "C:\\Users\\user\\My Project" },
+      { alias: "share", host: "win-vm", workspace: "\\\\vm\\projects\\service" }
+    ]
+  });
+  assert.equal(config.projects[0].workspace, "/home/user/My Project");
+  assert.equal(config.projects[1].workspace, "C:\\Users\\user\\My Project");
+  assert.equal(config.projects[2].workspace, "\\\\vm\\projects\\service");
+});
+
+test("project normalization rejects unknown hosts and relative or mismatched remote paths", () => {
+  assert.throws(() => normalizeConfiguredProjects({
+    projects: [{ alias: "broken", host: "missing", workspace: "/work" }]
+  }), /unknown host/);
+  for (const host of [false, 0, {}, []]) {
+    assert.throws(() => normalizeConfiguredProjects({
+      projects: [{ alias: "broken", host, workspace: "/work" }]
+    }), /unknown host/);
+  }
+  for (const workspace of [undefined, "", "project", "./project", "../project", "~/project", "C:\\project", "/a\u0000b"]) {
+    assert.throws(() => normalizeConfiguredProjects({
+      hosts: [remoteHost()],
+      projects: [{ host: "vm", workspace }]
+    }), /absolute remote path/);
+  }
+  for (const workspace of ["C:project", "\\project", "/home/user/project"]) {
+    assert.throws(() => normalizeConfiguredProjects({
+      hosts: [remoteHost("win-vm", "win32")],
+      projects: [{ host: "win-vm", workspace }]
+    }), /absolute remote path/);
+  }
+});
+
+test("same workspace on different hosts remains distinct and aliases stay globally unique", () => {
+  const config = normalizeConfiguredProjects({
+    hosts: [remoteHost("vm"), remoteHost("vm-two")],
+    projects: [
+      { alias: "service", host: "vm", workspace: "/work/service" },
+      { alias: "service", host: "vm-two", workspace: "/work/service" },
+      { alias: "duplicate", host: "vm", workspace: "/work/service" }
+    ]
+  });
+  assert.deepEqual(config.projects.map(({ alias, host }) => ({ alias, host })), [
+    { alias: "service", host: "vm" },
+    { alias: "service-2", host: "vm-two" }
+  ]);
+});
+
+test("ambiguous cross-host workspace or basename selection requires a host or exact alias", async () => {
+  const config = {
+    hosts: [remoteHost("vm"), remoteHost("vm-two")],
+    projects: [
+      { alias: "first", host: "vm", workspace: "/work/service" },
+      { alias: "second", host: "vm-two", workspace: "/work/service" }
+    ]
+  };
+  for (const token of ["/work/service", "service"]) {
+    const selection = resolveConfiguredProjectSelection(config, token);
+    assert.equal(selection.match, null);
+    assert.equal(selection.candidates.length, 2);
+    assert.equal(resolveExplicitConfiguredProject(config, token), null);
+    assert.equal(resolveConfiguredProject(config, token), null);
+    assert.equal((await resolveProjectReference(config, token))?.matchType, "ambiguousConfigured");
+    assert.equal(resolveConfiguredProjectSelection(config, token, { hostId: "vm-two" }).match.alias, "second");
+  }
+  assert.equal(resolveExplicitConfiguredProject(config, "second").host, "vm-two");
+  assert.throws(() => resolveConfiguredProjectSelection(config, "service", { hostId: "absent" }), /Unknown host/);
+});
+
+test("remote project matching handles Windows paths with spaces on every gateway platform", () => {
+  const config = {
+    hosts: [remoteHost("win-vm", "win32")],
+    projects: [{ alias: "win-service", host: "win-vm", workspace: "C:\\Projects\\My Service" }]
+  };
+  assert.equal(findConfiguredProject(config, "C:\\Projects\\My Service").alias, "win-service");
+  assert.equal(findConfiguredProject(config, "c:/projects/My Service").alias, "win-service");
+  assert.equal(findConfiguredProject(config, "My Service").alias, "win-service");
+  assert.equal(findConfiguredProject(config, "C:\\Projects\\My Service\\").alias, "win-service");
+});
+
+test("remote host resolution never discovers a same-named local directory", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "controller-projects-test-"));
+  try {
+    const repoDir = path.join(tempDir, "repo");
+    const localProject = path.join(tempDir, "code", "service");
+    await fs.mkdir(repoDir, { recursive: true });
+    await fs.mkdir(localProject, { recursive: true });
+    const config = {
+      hosts: [remoteHost()],
+      defaultProject: "vm-service",
+      projects: [{ alias: "vm-service", host: "vm", workspace: "/work/service" }]
+    };
+    const options = { homeDir: tempDir, repoRootDir: repoDir, hostId: "vm" };
+    assert.equal(await resolveProjectReference(config, localProject, options), null);
+    assert.equal(await resolveProjectReference(config, "service inside code directory", options), null);
+    assert.equal(await resolveProjectReference(config, "vm-service", { ...options, skipConfiguredSelection: true }), null);
+    assert.equal(await resolveProjectReference(config, "vm-service", { ...options, hostId: "host", skipConfiguredSelection: true }), null);
+    assert.equal(await resolveProjectReference(config, "service inside code directory", { homeDir: tempDir, repoRootDir: repoDir }), null);
+    assert.equal((await resolveProjectReference(config, "vm-service", options)).project.host, "vm");
+    const local = await resolveProjectReference(config, localProject, { ...options, hostId: "host" });
+    assert.equal(local.project.host, "host");
+    assert.equal(local.project.workspace, localProject);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
 });

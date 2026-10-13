@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { spawnNativeCodex } from "./codex-process.mjs";
+import { requestHostOperation, spawnHostAppServer } from "./controller-hosts.mjs";
 
 import {
   appServerPermissionParams,
@@ -457,21 +458,34 @@ async function runCodexExec({
   args,
   cwd
 }) {
-  const child = spawn(codexBin, args, {
+  const child = spawnNativeCodex(codexBin, args, {
     cwd,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
   let stderr = "";
+  let timedOut = false;
+  let forceTimer = null;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+    forceTimer = setTimeout(() => child.kill("SIGKILL"), 2000);
+    forceTimer.unref();
+  }, 120_000);
+  const clearTimers = () => {
+    clearTimeout(timer);
+    if (forceTimer) clearTimeout(forceTimer);
+  };
   child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString("utf8");
+    stderr = (stderr + chunk.toString("utf8")).slice(-64 * 1024);
   });
   child.stdout.on("data", () => {});
 
   return new Promise((resolve, reject) => {
-    child.once("error", reject);
+    child.once("error", (error) => { clearTimers(); reject(error); });
     child.once("close", (code, signal) => {
-      resolve({ code, signal, stderr });
+      clearTimers();
+      resolve({ code, signal, stderr: timedOut ? "Codex classification timed out." : stderr });
     });
   });
 }
@@ -528,6 +542,7 @@ function decisionToApprovalResponse(request, decision) {
 
 function startAppServerClient({
   codexBin,
+  host = null,
   workspace,
   model = null,
   profile = null,
@@ -538,19 +553,17 @@ function startAppServerClient({
   onClose = null
 }) {
   const resolvedPermissionLevel = resolvePermissionLevel(permissionLevel);
-  const child = spawn(
+  const child = spawnHostAppServer({
+    host,
     codexBin,
-    configArgs({
+    workspace,
+    args: configArgs({
       model,
       profile,
       search,
       permissionLevel: resolvedPermissionLevel
-    }),
-    {
-      cwd: workspace,
-      stdio: ["pipe", "pipe", "pipe"]
-    }
-  );
+    })
+  });
 
   let buffer = "";
   let nextRequestId = 0;
@@ -569,12 +582,14 @@ function startAppServerClient({
   function cleanupRequest(requestId) {
     const pending = pendingRequests.get(requestId);
     pendingRequests.delete(requestId);
+    if (pending?.timer) clearTimeout(pending.timer);
     return pending;
   }
 
   function rejectPending(error) {
     for (const [requestId, pending] of pendingRequests.entries()) {
       pending.reject(error);
+      clearTimeout(pending.timer);
       pendingRequests.delete(requestId);
     }
   }
@@ -638,8 +653,9 @@ function startAppServerClient({
     }
   }
 
+  child.stdout.setEncoding("utf8");
   child.stdout.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
+    buffer += chunk;
     let newlineIndex = buffer.indexOf("\n");
 
     while (newlineIndex >= 0) {
@@ -651,7 +667,7 @@ function startAppServerClient({
   });
 
   child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString("utf8");
+    stderr = (stderr + chunk.toString("utf8")).slice(-64 * 1024);
   });
 
   child.stdin.on("error", () => {});
@@ -690,9 +706,14 @@ function startAppServerClient({
     request(method, params) {
       const requestId = ++nextRequestId;
       return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanupRequest(requestId);
+          reject(new Error(`Codex app-server request ${method} timed out.`));
+        }, 120_000);
         pendingRequests.set(requestId, {
           resolve,
-          reject
+          reject,
+          timer
         });
 
         writeMessage({
@@ -704,6 +725,9 @@ function startAppServerClient({
           reject(error);
         });
       });
+    },
+    notify(method, params = {}) {
+      return writeMessage({ method, params });
     },
     respond(requestId, result) {
       pendingServerRequests.delete(requestId);
@@ -743,14 +767,27 @@ function startAppServerClient({
 
 export async function listCodexThreads({
   codexBin,
+  host = null,
   workspace,
   model = null,
   profile = null,
   search = false,
   limit = 20
 }) {
+  const hostPlatform = host?.platform ?? process.platform;
+  const paths = hostPlatform === "win32" || hostPlatform === "windows" ? path.win32 : path.posix;
+  if (typeof workspace !== "string" || !paths.isAbsolute(workspace)) {
+    throw new Error("Listing Codex sessions requires an absolute workspace on the selected host.");
+  }
+  // Native thread/list compares stored cwd strings exactly. The desktop app and
+  // CLI may persist either Windows separator spelling for the same directory.
+  const normalizedWorkspace = paths.normalize(workspace);
+  const cwd = paths === path.win32
+    ? [...new Set([normalizedWorkspace, normalizedWorkspace.replaceAll("\\", "/")])]
+    : normalizedWorkspace;
   const client = startAppServerClient({
     codexBin,
+    host,
     workspace,
     model,
     profile,
@@ -767,10 +804,14 @@ export async function listCodexThreads({
       }
     });
 
+    await client.notify("initialized");
+
     const result = await client.request("thread/list", {
       cursor: null,
       limit,
-      sortKey: "created_at"
+      sortKey: "updated_at",
+      cwd,
+      sourceKinds: ["cli", "vscode", "exec", "appServer"]
     });
 
     return result.data ?? [];
@@ -782,11 +823,18 @@ export async function listCodexThreads({
 
 export async function classifyVoiceCommandIntent({
   codexBin,
+  host = null,
   workspace,
   transcript,
   activeProjectAlias = null,
   projects = []
 }) {
+  if (host?.transport === "ssh") {
+    return requestHostOperation(host, {
+      operation: "codex.classifyVoice", workspace, transcript, activeProjectAlias, projects
+    }, { timeoutMs: 120_000 });
+  }
+  codexBin = host?.codexBin ?? codexBin;
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "whatsapp-relay-voice-intent-"));
   const schemaPath = path.join(tempDir, "voice-command-intent.schema.json");
   const outputPath = path.join(tempDir, "voice-command-intent.json");
@@ -847,11 +895,18 @@ export async function classifyVoiceCommandIntent({
 
 export async function classifyProjectIntent({
   codexBin,
+  host = null,
   workspace,
   intent,
   activeProjectAlias = null,
   projects = []
 }) {
+  if (host?.transport === "ssh") {
+    return requestHostOperation(host, {
+      operation: "codex.classifyProject", workspace, intent, activeProjectAlias, projects
+    }, { timeoutMs: 120_000 });
+  }
+  codexBin = host?.codexBin ?? codexBin;
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "whatsapp-relay-project-intent-"));
   const schemaPath = path.join(tempDir, "project-intent.schema.json");
   const outputPath = path.join(tempDir, "project-intent.json");
@@ -912,6 +967,7 @@ export async function classifyProjectIntent({
 
 export function startCodexTurn({
   codexBin,
+  host = null,
   workspace,
   prompt,
   threadId = null,
@@ -932,6 +988,7 @@ export function startCodexTurn({
   const permissionParams = appServerPermissionParams(resolvedPermissionLevel);
   const client = startAppServerClient({
     codexBin,
+    host,
     workspace,
     model,
     profile,
@@ -947,6 +1004,8 @@ export function startCodexTurn({
   let settled = false;
   let fallbackReply = "";
   let finalReply = "";
+  let startingTurn = false;
+  const earlyNotifications = [];
 
   const agentMessages = new Map();
 
@@ -991,6 +1050,12 @@ export function startCodexTurn({
   }
 
   function handleNotification(message) {
+    // A native or SSH pipe can deliver the turn/start response and the first
+    // notifications in one chunk, before the awaiting bootstrap has resumed.
+    if (startingTurn && !activeTurnId) {
+      earlyNotifications.push(message);
+      return;
+    }
     const event = normalizeCodexTurnNotification(message, {
       activeTurnId,
       resolvedThreadId
@@ -1121,6 +1186,8 @@ export function startCodexTurn({
       }
     });
 
+    await client.notify("initialized");
+
     const requirementsResult = await client
       .request("configRequirements/read", {})
       .catch(() => ({ requirements: null }));
@@ -1143,6 +1210,9 @@ export function startCodexTurn({
         });
 
     resolvedThreadId = threadResult.thread.id;
+    if (threadId && threadResult.thread.status?.type === "active") {
+      throw new Error("This Codex thread is already running. Wait for its active turn to finish before resuming it from WhatsApp.");
+    }
 
     if (threadName?.trim()) {
       await client
@@ -1153,6 +1223,7 @@ export function startCodexTurn({
         .catch(() => {});
     }
 
+    startingTurn = true;
     const turnResult = await client.request("turn/start", {
       threadId: resolvedThreadId,
       input: buildPromptInput(prompt),
@@ -1163,11 +1234,13 @@ export function startCodexTurn({
     });
 
     activeTurnId = turnResult.turn.id;
+    startingTurn = false;
     onLifecycleEvent?.({
       type: "turnStarted",
       turnId: activeTurnId,
       threadId: resolvedThreadId
     });
+    for (const notification of earlyNotifications.splice(0)) handleNotification(notification);
   })();
 
   bootstrap.catch((error) => {
