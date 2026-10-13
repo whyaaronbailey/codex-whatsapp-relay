@@ -89,7 +89,7 @@ test("attaching to another relay slot gives scoped follow-up commands without se
 
 test("the selected relay slot retains working shorthand and normal-message guidance", async (t) => {
   const f = await fixture(t);
-  await f.bridge.sendThreadList(request.phoneKey, request.remoteJid);
+  await f.bridge.sendThreadList(request.phoneKey, request.remoteJid, "desktop/main");
   assert.match(f.messages.at(-1).content.text, /Use \/1, \/2/);
   await f.bridge.connectToThread({ ...request, payload: "1" });
   assert.match(f.messages.at(-1).content.text, /Next: send a normal message/);

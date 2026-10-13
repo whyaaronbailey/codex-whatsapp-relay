@@ -9,6 +9,9 @@ import { normalizePermissionLevel } from "./controller-permissions.mjs";
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
 const METADATA_BYTES = 256 * 1024;
+const MAX_PROJECT_DIRECTORIES = 2000;
+const MAX_INDEX_ENTRIES = 20000;
+const MAX_METADATA_READS = 1000;
 
 // Use the installed CLI and its normal user/project configuration. In
 // particular, do not pass --bare, --safe-mode, or --strict-mcp-config: those
@@ -58,17 +61,37 @@ function configRoot(claudeConfigDir) {
   return path.resolve(claudeConfigDir || process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"));
 }
 
-function projectDirectories(workspace, claudeConfigDir) {
+function projectDirectories(workspace, claudeConfigDir, scope = "workspace") {
   const projects = path.join(configRoot(claudeConfigDir), "projects");
   // Claude's filesystem slug is not unique (a_b and a-b collide). Verify cwd
   // inside every transcript too, including on resume, rather than trusting it.
   const slug = workspace.replace(/[^a-zA-Z0-9]/g, "-");
-  let entries;
-  try { entries = fs.readdirSync(projects, { withFileTypes: true }); }
+  let directory;
+  try { directory = fs.opendirSync(projects); }
   catch (error) { if (error.code === "ENOENT") return []; throw error; }
-  return entries.filter(entry => entry.isDirectory() && (process.platform === "win32"
-    ? entry.name.toLowerCase() === slug.toLowerCase() : entry.name === slug))
-    .map(entry => path.join(projects, entry.name));
+  const matches = [];
+  let scanned = 0;
+  try {
+    for (let entry; (entry = directory.readSync()) !== null;) {
+      if (++scanned > MAX_INDEX_ENTRIES) throw new Error("Claude session index exceeds the entry scan limit.");
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      if (scope !== "host" && !(process.platform === "win32"
+        ? entry.name.toLowerCase() === slug.toLowerCase() : entry.name === slug)) continue;
+      const candidate = path.join(projects, entry.name);
+      // Windows Node 20 readdir may classify a junction as an ordinary
+      // directory. Check the path itself before opening any native index.
+      try {
+        const stat = fs.lstatSync(candidate);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+      } catch (error) {
+        if (["ENOENT", "EACCES", "EPERM"].includes(error.code)) continue;
+        throw error;
+      }
+      matches.push(candidate);
+      if (matches.length > MAX_PROJECT_DIRECTORIES) throw new Error("Claude session index exceeds the project scan limit. Use workspace scope.");
+    }
+  } finally { directory.closeSync(); }
+  return matches;
 }
 
 function parseLines(text, { trimStart = false, trimEnd = false } = {}) {
@@ -103,7 +126,9 @@ function sessionMetadata(file, workspace, id) {
     }
     const native = records.filter(record => record.sessionId === id && !record.isSidechain);
     const cwdRecord = native.find(record => typeof record.cwd === "string");
-    if (!cwdRecord || !equalWorkspace(cwdRecord.cwd, workspace)) return null;
+    if (!cwdRecord || /[\x00-\x1f\x7f]/.test(cwdRecord.cwd) || !path.isAbsolute(cwdRecord.cwd) ||
+        (process.platform === "win32" && !/^(?:[a-z]:\\|\\\\[^\\]+\\[^\\]+\\)/i.test(path.normalize(cwdRecord.cwd))) ||
+        (workspace !== null && !equalWorkspace(cwdRecord.cwd, workspace))) return null;
     const title = native.findLast(record => record.type === "custom-title")?.customTitle ||
       native.findLast(record => record.type === "ai-title")?.aiTitle;
     const user = native.find(record => record.type === "user" && !record.isMeta);
@@ -121,18 +146,41 @@ function sessionMetadata(file, workspace, id) {
 
 // Bounded reads of native transcripts avoid another SDK/CLI installation and
 // do not start a model request, rewrite history, or create a second memory DB.
-export async function listClaudeThreads({ workspace, limit = 20, claudeConfigDir } = {}) {
+export async function listClaudeThreads({ workspace, scope = "workspace", limit = 20, claudeConfigDir } = {}) {
+  if (!["workspace", "host"].includes(scope)) throw new Error("Claude session scope must be workspace or host.");
   const cwd = normalizedWorkspace(workspace);
-  const sessions = [];
-  for (const directory of projectDirectories(cwd, claudeConfigDir)) {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const id = entry.name.replace(/\.jsonl$/, "");
-      if (!entry.isFile() || !entry.name.endsWith(".jsonl") || !UUID.test(id)) continue;
-      const metadata = sessionMetadata(path.join(directory, entry.name), cwd, id);
-      if (metadata) sessions.push(metadata);
-    }
+  const resultLimit = Math.max(1, Math.min(200, Math.trunc(Number(limit)) || 20));
+  const candidates = [];
+  let scanned = 0;
+  for (const directory of projectDirectories(cwd, claudeConfigDir, scope)) {
+    const index = fs.opendirSync(directory);
+    try {
+      for (let entry; (entry = index.readSync()) !== null;) {
+        if (++scanned > MAX_INDEX_ENTRIES) throw new Error("Claude session index exceeds the entry scan limit. Use workspace scope.");
+        const id = entry.name.replace(/\.jsonl$/, "");
+        if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.endsWith(".jsonl") || !UUID.test(id)) continue;
+        const file = path.join(directory, entry.name);
+        try {
+          const stat = fs.lstatSync(file);
+          if (stat.isFile() && !stat.isSymbolicLink()) candidates.push({ file, id, updated: stat.mtimeMs });
+        } catch (error) { if (!["ENOENT", "EACCES", "EPERM"].includes(error.code)) throw error; }
+      }
+    } finally { index.closeSync(); }
   }
-  return sessions.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, Math.max(1, Math.min(100, Number(limit) || 20)));
+  candidates.sort((a, b) => b.updated - a.updated || a.id.localeCompare(b.id));
+  const sessions = [];
+  const ids = new Set();
+  for (let index = 0; index < candidates.length; index++) {
+    if (index >= MAX_METADATA_READS) throw new Error("Claude session discovery exceeded its metadata read limit. Use workspace scope.");
+    const { file, id } = candidates[index];
+    if (ids.has(id)) continue;
+    const metadata = sessionMetadata(file, scope === "host" ? null : cwd, id);
+    if (!metadata) continue;
+    ids.add(id);
+    sessions.push(metadata);
+    if (sessions.length === resultLimit) break;
+  }
+  return sessions;
 }
 
 function validateResume(threadId, workspace, claudeConfigDir) {

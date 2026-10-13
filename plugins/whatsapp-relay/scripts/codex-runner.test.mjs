@@ -41,7 +41,13 @@ async function makeMockCodex(t) {
       if(message.method==='initialize'){reply({});continue;}
       if(!initialized){send({id:message.id,error:{message:'initialized notification missing'}});continue;}
       switch(message.method){
-        case 'thread/list': reply({data:[{id:'saved-thread',preview:JSON.stringify({cwd:process.cwd(),home:process.env.CODEX_HOME??null,args,listParams:message.params})}]});break;
+        case 'thread/list': {
+          let pages; try {pages=JSON.parse(await fs.readFile(new URL('./mock-threads.json',import.meta.url),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
+          const page=pages?.[message.params.cursor??'first']??{data:[{id:'saved-thread',cwd:process.cwd(),name:'Saved native session',updatedAt:123}]};
+          const cwd=message.params.cwd;
+          const data=page.data.filter(row=>!cwd||(Array.isArray(cwd)?cwd.includes(row.cwd):cwd===row.cwd));
+          reply({...page,data:data.map(row=>({...row,preview:JSON.stringify({cwd:process.cwd(),home:process.env.CODEX_HOME??null,args,listParams:message.params})}))});break;
+        }
         case 'configRequirements/read':reply({requirements:null});break;
         case 'thread/name/set':reply({});break;
         case 'thread/start':reply({thread:{id:thread,status:{type:'idle'}}});break;
@@ -94,6 +100,50 @@ test("native Codex listing inherits the user's context and completes the app-ser
 
 test("native session discovery refuses an unscoped relative workspace", async () => {
   await assert.rejects(listCodexThreads({ workspace: "relative-directory" }), /absolute workspace/);
+});
+
+test("native host discovery omits cwd filtering, follows pages and preserves actual directory and status", { timeout: 5000 }, async t => {
+  const fixture = await makeMockCodex(t);
+  const other = path.join(fixture.workspace, "another-project");
+  await fs.writeFile(path.join(fixture.workspace, "mock-threads.json"), JSON.stringify({
+    first: { data: [
+      { id: "newest", cwd: other, name: "Other native project", updatedAt: 300, status: { type: "active" } },
+      { id: "invalid", cwd: "relative", updatedAt: 250 },
+      { id: "unsafe", cwd: other + "\n", updatedAt: 240 },
+      ...(process.platform === "win32" ? [{ id: "drive-relative", cwd: "\\folder", updatedAt: 230 }] : [])
+    ], nextCursor: "second" },
+    second: { data: [{ id: "older", cwd: fixture.workspace, name: "Current project", updatedAt: 200 }], nextCursor: null }
+  }));
+  const rows = await listCodexThreads({ ...fixture, scope: "host", limit: 500 });
+  assert.deepEqual(rows.map(row => [row.id, row.cwd]), [["newest", other], ["older", fixture.workspace]]);
+  assert.deepEqual(rows[0].status, { type: "active" });
+  for (const row of rows) {
+    const request = JSON.parse(row.preview);
+    assert.equal(request.cwd, fixture.workspace, "launch cwd remains configured workspace");
+    assert.equal(Object.hasOwn(request.listParams, "cwd"), false);
+    assert.equal(request.listParams.limit, 100, "native page size is bounded");
+  }
+  const scoped = await listCodexThreads(fixture);
+  assert.deepEqual(scoped.map(row => row.id), ["older"]);
+});
+
+test("native host discovery caps results at 200", { timeout: 5000 }, async t => {
+  const fixture = await makeMockCodex(t);
+  const rows = Array.from({ length: 205 }, (_, index) => ({ id: `native-${index}`, cwd: fixture.workspace, updatedAt: 1000 - index }));
+  await fs.writeFile(path.join(fixture.workspace, "mock-threads.json"), JSON.stringify({
+    first: { data: rows.slice(0, 100), nextCursor: "second" },
+    second: { data: rows.slice(100), nextCursor: null }
+  }));
+  assert.equal((await listCodexThreads({ ...fixture, scope: "host", limit: 1000 })).length, 200);
+});
+
+test("native session discovery rejects invalid scopes and pagination loops", { timeout: 5000 }, async t => {
+  const fixture = await makeMockCodex(t);
+  await assert.rejects(listCodexThreads({ ...fixture, scope: "global-typo" }), /scope/);
+  await fs.writeFile(path.join(fixture.workspace, "mock-threads.json"), JSON.stringify({
+    first: { data: [], nextCursor: "same" }, same: { data: [], nextCursor: "same" }
+  }));
+  await assert.rejects(listCodexThreads({ ...fixture, scope: "host" }), /repeated cursor/);
 });
 
 test("native resume forwards approvals and returns lifecycle events and Unicode reply", { timeout: 5000 }, async (t) => {

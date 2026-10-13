@@ -1,8 +1,8 @@
 # One WhatsApp gateway for a PC and VM
 
-The main PC runs one WhatsApp controller. A configured project selects either local Codex or Codex on the VM over SSH. The VM runs the relay worker on demand; it does not need a second WhatsApp login, controller daemon, agent framework, or memory service.
+The main PC runs one WhatsApp controller. Choose a computer with `/host`, browse its conversations with `/sessions`, then select one with `/session 1`. The conversation supplies its directory and coding tool automatically. The VM runs the relay worker on demand; it does not need a second WhatsApp login, controller daemon, agent framework, or memory service.
 
-For OpenCode/OpenChamber, Claude Code, or several simultaneous conversations in one project, see [named sessions and coding tools](multiple-agents.md). The machine and file setup below applies to all three engines.
+For OpenCode/OpenChamber, Claude Code, or several simultaneous conversations in one directory, see [named sessions and coding tools](multiple-agents.md). The machine and file setup below applies to all three engines.
 
 ```text
 WhatsApp phone
@@ -31,7 +31,7 @@ ssh -T -o BatchMode=yes relay-vm codex --version
 
 If the noninteractive SSH environment cannot locate Node or Codex, configure absolute `nodeBin` and `codexBin` paths for the VM host. A custom `CODEX_HOME` must be available in the corresponding machine's process environment; the gateway does not copy its own environment to the VM.
 
-## Configure hosts and named projects
+## Configure computers and coding tools
 
 Register the full release checkout's MCP server in Codex on the gateway PC. From the repository root in PowerShell:
 
@@ -59,15 +59,15 @@ Important fields:
 | `hosts[].workerPath` | Absolute path to `relay-worker.mjs` on the VM. |
 | `hosts[].nodeBin` / `codexBin` | Optional executable paths on that machine. |
 | `projects[].host` | Configured machine ID; defaults to `host` for legacy projects. |
-| `projects[].alias` | Globally unique project name used for session selection. |
+| `projects[].alias` | Globally unique directory shortcut, retained under this configuration key for compatibility. |
 | `projects[].workspace` | Absolute workspace on the selected machine. Remote `~` and relative paths are rejected. |
 | `maxAttachmentBytes` | Positive integer up to 26,214,400 bytes (25 MiB); defaults to this maximum. |
 
 The example targets a Windows PC and Windows VM. The SSH launcher uses Windows PowerShell with an encoded bootstrap so Node and worker paths can contain spaces. For a Linux VM, set its `platform` to `linux`, `workerPath` to an absolute POSIX path such as `/opt/codex-whatsapp-relay/plugins/whatsapp-relay/scripts/relay-worker.mjs`, and its project workspace to a path such as `/home/agent/projects/example`.
 
-Use distinct aliases such as `pc-work` and `vm-work` even if both machines store the project at an identical path. Remote POSIX paths remain POSIX paths when the gateway runs on Windows. An ambiguous workspace path or basename requires an explicit project alias or host selection. Remote projects must be configured ahead of time; local directory discovery does not search a VM.
+Use distinct directory shortcuts such as `pc-work` and `vm-work` even if both machines store files at an identical path. Remote POSIX paths remain POSIX paths when the gateway runs on Windows. Configure at least one working route for each coding tool you want to discover on each computer. Its workspace is a launch directory, not a restriction on host-wide discovery. Additional session directories are selected automatically from native metadata.
 
-To resume an existing VM conversation, set its project's `workspace` to the folder that conversation actually uses. Pointing every project at the relay's installation folder will only find sessions from that folder. `/sessions` reports the host, engine and workspace it searches. Select the correct project first, then use `/sessions` and `/session <number>` to attach the existing conversation.
+To resume an existing VM conversation, send `/host vm`, `/sessions`, and `/session <number>`. The list searches native session stores across directories for the configured coding tools on that computer. Selecting a conversation activates its real directory and engine. `/dir <absolute path or shortcut>` optionally narrows the list; `/dir all` clears that filter. The internal `projects` configuration schema and legacy `/project` commands remain compatible.
 
 ## Control sessions from WhatsApp
 
@@ -75,24 +75,25 @@ Send commands from an allowed direct chat. A self-chat can be used when the link
 
 | Message | Result |
 | --- | --- |
-| `/hosts` | Lists machines and configured projects; marks the active machine. |
-| `/host host pc-work` | Selects the local project. |
-| `/host vm vm-work` | Selects the VM project. |
-| `/host vm` | Selects a project on the VM; use the explicit alias when it has several. |
-| `/projects` | Lists configured projects and session status. |
-| `/new Summarize this repository` | Starts a new native Codex session in the active project. |
-| `/sessions` | Lists recent native Codex sessions for the active project's machine and workspace. |
-| `/session 1` or `/1` | Selects an item from that session list. |
-| Plain text | Continues the active project's selected session. |
-| `/status` | Shows the active project's session status. |
-| `/files` | Lists up to 20 recent stored incoming/outgoing attachments for the active project. |
+| `/hosts` | Lists computers and marks the selected computer. |
+| `/host host` | Selects the PC and clears the directory filter. |
+| `/host vm` | Selects the VM and clears the directory filter. |
+| `/dir`, `/dirs` | Shows the directory/filter or lists configured directory shortcuts. |
+| `/dir C:\Work\My Repository` | Selects that directory on the current computer and narrows the session list. |
+| `/dir all` | Returns to listing across directories. |
+| `/new Summarize this repository` | Starts a native session in the selected directory. |
+| `/sessions`, `/sessions more` | Lists native conversations on the selected computer, with optional directory filtering and additional pages. |
+| `/session 1` or `/1` | Selects a listed conversation and its directory and coding tool automatically. |
+| Plain text | Continues the selected session. |
+| `/status` | Shows the selected computer, directory and session status. |
+| `/files` | Lists up to 20 recent stored incoming/outgoing attachments for the selected directory. |
 | `/send reports/result.pdf` | Sends that workspace-relative file back to the chat. |
 
-Switching machines changes which project receives subsequent prompts and uploads. Each project keeps its own named threads and selected thread. Existing desktop sessions are discoverable through the selected machine's native account. This continues native sessions through the tool's integration interface; it does not control desktop windows.
+Session discovery uses the selected computer's native account and configured services. The list includes saved conversations; native activity is not always available, so saved sessions are not automatically described as running or idle. Discovery is bounded to 200 results per configured provider source and paged for WhatsApp. Failures from one coding tool are reported alongside successful results from others. Changing computers or directory filters invalidates old numbered choices. This continues native sessions through the tool's integration interface; it does not control desktop windows.
 
 ## Where files go
 
-Attach a document or image in the chat after selecting the destination project. The relay saves it on that project's machine under:
+Attach a document or image in the chat after selecting a conversation or directory. The relay saves it on the selected computer under:
 
 ```text
 <workspace>/.whatsapp-relay/inbox/<transfer-id>/<sanitized-filename>

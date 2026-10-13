@@ -4,6 +4,8 @@ import { setTimeout as delay } from "node:timers/promises";
 // Connect to the server already used by OpenCode/OpenChamber. This adapter never
 // launches a second server, changes native permissions, or retries submissions.
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_DISCOVERY_SESSIONS = 200;
+const MAX_DISCOVERY_PAGES = 10;
 const SESSION_ID = /^ses_[A-Za-z0-9_-]+$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -60,7 +62,7 @@ function createClient(options) {
   workspacePath(workspace);
   let v2;
 
-  async function request(method, route, body, { timeoutMs = options.requestTimeoutMs ?? 15_000, signal = null, scoped = true } = {}) {
+  async function request(method, route, body, { timeoutMs = options.requestTimeoutMs ?? 15_000, signal = null, scoped = true, includeHeaders = false } = {}) {
     const url = new URL(`${base.href.replace(/\/$/, "")}${route}`);
     if (v2 === false && scoped) url.searchParams.set("directory", workspace);
     const controller = new AbortController();
@@ -95,7 +97,10 @@ function createClient(options) {
         if (bytes > MAX_RESPONSE_BYTES) { controller.abort(); throw new Error("OpenCode response exceeds the relay size limit."); }
         chunks.push(Buffer.from(value));
       }
-      try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+      try {
+        const data = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        return includeHeaders ? { data, headers: response.headers } : data;
+      }
       catch { throw new Error("OpenCode returned invalid JSON."); }
     } catch (error) {
       // Fetch errors can contain a URL or credentials from the environment.
@@ -130,8 +135,11 @@ function createClient(options) {
 
 export async function listOpenCodeThreads(options) {
   if (options.host?.transport === "ssh") throw new Error("Run the OpenCode adapter inside the selected host's relay worker.");
+  const scope = options.scope ?? "workspace";
+  if (!["workspace", "project", "host"].includes(scope)) throw new Error("OpenCode session scope must be workspace or host.");
   const client = createClient(options);
   await client.initialize();
+  if (scope === "host") return listHostThreads(client, options);
   const limit = Math.max(1, Math.min(100, options.limit ?? 20));
   const query = new URLSearchParams({ directory: options.workspace, limit: String(limit), ...(client.v2 ? { order: "desc" } : {}) });
   const response = await client.request("GET", `${client.prefix}/session?${query}`);
@@ -142,13 +150,80 @@ export async function listOpenCodeThreads(options) {
   // Do not rely solely on the server's filter: v1 releases differ in behavior.
   return sessions.filter((item) => {
     const directory = client.v2 ? item.location?.directory : item.directory;
-    return directory && workspacePath(directory) === workspacePath(options.workspace) && !item.time?.archived;
+    return absoluteSessionDirectory(directory) && workspacePath(directory) === workspacePath(options.workspace) && !item.time?.archived;
   }).slice(0, limit).map((item) => ({
     id: sessionId(item.id), name: item.title ?? null, preview: item.title ?? "OpenCode session",
     cwd: client.v2 ? item.location.directory : item.directory,
     createdAt: Math.floor((item.time?.created ?? 0) / 1000),
     updatedAt: Math.floor((item.time?.updated ?? 0) / 1000),
     status: { type: active[item.id] && (client.v2 || active[item.id].type !== "idle") ? "active" : "idle" }, engine: "opencode"
+  }));
+}
+
+function absoluteSessionDirectory(directory) {
+  // A drive-relative Windows path is not a resumable native workspace.
+  return typeof directory === "string" && !/[\u0000-\u001f\u007f]/.test(directory) && (
+    path.posix.isAbsolute(directory) || /^[A-Za-z]:[\\/]/.test(directory) || /^\\\\[^\\]+\\[^\\]+/.test(directory)
+  );
+}
+
+async function listHostThreads(client, options) {
+  const requested = Number(options.limit ?? 20);
+  const limit = Number.isFinite(requested) ? Math.max(1, Math.min(MAX_DISCOVERY_SESSIONS, Math.floor(requested))) : 20;
+  const sessions = new Map();
+  const cursors = new Set();
+  let cursor;
+  // V2's SessionsAllQuery lists the server database without directory/project.
+  // V1's ordinary /session is instance-scoped; only /experimental/session is
+  // explicitly global. Never substitute a project list for a host discovery.
+  // Native contracts: anomalyco/opencode v2.0.27 packages/core/src/session/store.ts
+  // and v1.2.27 packages/opencode/src/server/routes/experimental.ts.
+  const route = client.v2 ? "/api/session" : "/experimental/session";
+  for (let page = 0; page < MAX_DISCOVERY_PAGES; page++) {
+    const query = new URLSearchParams({ limit: String(limit - sessions.size) });
+    if (cursor !== undefined) query.set("cursor", cursor);
+    else if (client.v2) query.set("order", "desc");
+    let response;
+    try {
+      response = await client.request("GET", `${route}?${query}`, undefined, { scoped: false, includeHeaders: true });
+    } catch (error) {
+      if (error.status === 404 || error.notJson) {
+        throw new Error("This OpenCode server does not expose the native host-wide session list. Use project session listing or a server version with global discovery support.");
+      }
+      throw error;
+    }
+    const items = listData(response.data, client.v2, "host sessions");
+    if (items.length > MAX_DISCOVERY_SESSIONS) throw new Error("OpenCode host session page exceeds the relay discovery limit.");
+    for (const item of items) {
+      const directory = client.v2 ? item?.location?.directory : item?.directory;
+      if (!absoluteSessionDirectory(directory) || !SESSION_ID.test(item?.id ?? "") || item.time?.archived) continue;
+      if (!sessions.has(item.id)) sessions.set(item.id, item);
+      if (sessions.size >= limit) break;
+    }
+    const next = client.v2 ? response.data.cursor?.next : response.headers.get("x-next-cursor");
+    if (sessions.size >= limit || !items.length || next === undefined || next === null || next === "") break;
+    if (typeof next !== "string" || next.length > 8192 || (!client.v2 && !/^\d+$/.test(next))) {
+      throw new Error("OpenCode returned an invalid host session cursor.");
+    }
+    if (cursors.has(next)) throw new Error("OpenCode host session pagination repeated a cursor.");
+    cursors.add(next);
+    cursor = next;
+    if (page === MAX_DISCOVERY_PAGES - 1) throw new Error("OpenCode host discovery exceeded 10 pages; narrow the requested session list.");
+  }
+  // V1 /session/status belongs to one instance. Its missing IDs cannot establish
+  // that sessions in other directories are idle, so omit status for global V1.
+  let active;
+  if (client.v2) {
+    active = (await client.request("GET", "/api/session/active", undefined, { scoped: false }))?.data;
+    if (!active || typeof active !== "object" || Array.isArray(active)) throw new Error("OpenCode returned invalid active-session status.");
+  }
+  return [...sessions.values()].map((item) => ({
+    id: item.id, name: item.title ?? null, preview: item.title ?? "OpenCode session",
+    cwd: client.v2 ? item.location.directory : item.directory,
+    createdAt: Math.floor((item.time?.created ?? 0) / 1000),
+    updatedAt: Math.floor((item.time?.updated ?? 0) / 1000),
+    ...(active ? { status: { type: active[item.id] ? "active" : "idle" } } : {}),
+    engine: "opencode"
   }));
 }
 

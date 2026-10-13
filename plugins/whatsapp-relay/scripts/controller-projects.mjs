@@ -170,6 +170,22 @@ function normalizeWorkspace(workspace, host) {
   return pathApi.normalize(source);
 }
 
+export function normalizeDirectoryPath(value, host) {
+  const source = String(value ?? "").trim().replace(/^"(.*)"$/, "$1");
+  const absolute = host.platform === "win32"
+    ? /^(?:[a-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/i.test(source)
+    : source.startsWith("/") && !source.startsWith("//") && !source.includes("\\");
+  if (!absolute || /[\u0000-\u001f]/.test(source)) throw new Error("Use an absolute directory path on the selected computer.");
+  return (host.platform === "win32" ? path.win32 : path.posix).normalize(source);
+}
+
+export function directoryPathKey(value, host) {
+  const normalized = normalizeDirectoryPath(value, host);
+  const api = host.platform === "win32" ? path.win32 : path.posix;
+  const key = normalized === api.parse(normalized).root ? normalized : normalized.replace(/[\\/]+$/, "");
+  return host.platform === "win32" ? key.toLowerCase() : key;
+}
+
 function workspaceKey(project) {
   const pathApi = workspacePathApi(project.workspace);
   let workspace = pathApi.normalize(project.workspace);
@@ -177,7 +193,7 @@ function workspaceKey(project) {
     workspace = workspace.replace(/[\\/]+$/, "");
   }
   // Windows workspace names are case-insensitive; POSIX names are not.
-  return `${project.host}\u0000${project.engine ?? "codex"}\u0000${workspacePathApi(workspace) === path.win32 ? workspace.toLowerCase() : workspace}`;
+  return `${project.host}\u0000${project.engine ?? "codex"}\u0000${workspacePathApi(workspace) === path.win32 ? workspace.toLowerCase() : workspace}\u0000${project.engine === "opencode" ? JSON.stringify([project.opencodeUrl, project.opencodeApiVersion, project.opencodeUsernameEnv, project.opencodePasswordEnv]) : ""}`;
 }
 
 function normalizeProjectConfig(project = {}, { fallbackAlias = DEFAULT_PROJECT_ALIAS, hosts } = {}) {

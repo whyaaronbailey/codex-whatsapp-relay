@@ -1,4 +1,5 @@
-import { randomInt } from "node:crypto";
+import { randomInt, createHash } from "node:crypto";
+import path from "node:path";
 
 import {
   classifyProjectIntent as classifyProjectIntentWithCodex,
@@ -14,6 +15,8 @@ import {
 import {
   normalizeConfiguredProjects,
   normalizeProjectAlias,
+  normalizeDirectoryPath,
+  directoryPathKey,
   resolveExplicitConfiguredProject,
   resolveConfiguredProject,
   resolveConfiguredProjectSelection,
@@ -49,6 +52,7 @@ const RECENT_MESSAGE_LIMIT = 500;
 const OUTBOX_POLL_MS = 1_000;
 const SESSION_LIST_LIMIT = 12;
 const SESSION_CONNECT_SEARCH_LIMIT = 50;
+const HOST_SESSION_LIMIT = 200;
 const THREAD_SHORTCUT_TTL_MS = 30 * 60_000;
 const DANGER_CONFIRMATION_WINDOW_MS = 60_000;
 const ACTIVE_RUN_PREVIEW_LIMIT = 160;
@@ -66,6 +70,29 @@ export function projectBindingKey(config, project) {
     host.codexBin ?? config.codexBin ?? "codex", project.workspace,
     ...(project.engine && project.engine !== "codex"
       ? [project.engine, project.engine === "opencode" ? project.opencodeUrl ?? null : host.claudeBin ?? config.claudeBin ?? "claude"] : [])]);
+}
+
+function providerConnectionKey(config, project) {
+  const host = resolveHost(config, project.host ?? "host");
+  return JSON.stringify([host, project.engine ?? "codex",
+    host.codexBin ?? config.codexBin ?? "codex", host.claudeBin ?? config.claudeBin ?? "claude",
+    project.opencodeUrl ?? null, project.opencodeApiVersion ?? null,
+    project.opencodeUsernameEnv ?? null, project.opencodePasswordEnv ?? null]);
+}
+
+function discoverySourceKey(config, project) {
+  return JSON.stringify([providerConnectionKey(config, project), project.model ?? config.model,
+    project.profile ?? config.profile, project.search ?? config.search,
+    resolveSessionPermissionLevel(config, project, {})]);
+}
+
+function invalidateChangedSelection(chat, patch) {
+  const changedDirectory = patch.activeProject && patch.activeProject !== chat.activeProject;
+  if (!changedDirectory && !Object.hasOwn(patch, "directoryFilter")) return;
+  chat.hostSessionBrowser = null;
+  chat.legacySessionChoiceScope = null;
+  chat.browserRevision = (chat.browserRevision ?? 0) + 1;
+  if (changedDirectory && !Object.hasOwn(patch, "directoryFilter")) chat.directoryFilter = null;
 }
 
 function invalidControllerCommandError(message) {
@@ -94,6 +121,8 @@ const COMMAND_ALIASES = new Map([
   ["files", "files"],
   ["send", "sendFile"],
   ["project", "project"],
+  ["dir", "directory"],
+  ["dirs", "projects"],
   ["status", "status"],
   ["st", "status"],
   ["in", "projectPrompt"],
@@ -279,8 +308,9 @@ function formatThreadTimestamp(value) {
     return null;
   }
 
-  const timestamp = value > 1_000_000_000_000 ? value : value * 1000;
-  return new Date(timestamp).toISOString();
+  const numeric = Number(value);
+  const timestamp = Number.isFinite(numeric) ? (numeric > 1_000_000_000_000 ? numeric : numeric * 1000) : Date.parse(value);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
 function sanitizeThreadPreview(value) {
@@ -349,26 +379,30 @@ function projectHelpFooter() {
 
 function helpText() {
   return [
-    "WhatsApp Codex bridge commands:",
-    "/hosts -> list configured machines and their projects",
-    "/host <id> [project] -> select a machine (and optionally its project)",
-    "/files -> list stored attachments in the active machine/project",
+    "WhatsApp coding relay commands:",
+    "/hosts -> list computers and coding tools",
+    "/host <id> -> select a computer and clear the directory filter",
+    "/sessions or /ls -> browse saved sessions across directories on that computer",
+    "/sessions more -> next page of the same numbered list",
+    "/session <number> or /<number> -> select its native session, tool, and directory automatically",
+    "/dir -> show selected directory and session-list filter",
+    "/dir <alias or absolute path> -> select a directory and narrow session discovery",
+    "/dir all -> search across directories again; keeps the selected session",
+    "/dirs -> list known directory shortcuts; no setup is needed to select a discovered session",
+    "/status or /st -> show computer, tool, directory, session, and relay activity",
+    "/files -> list stored attachments in the selected directory",
     "/send <relative file path> -> send a file from the active workspace",
     "Send a document, image, or video to save it in the active workspace; add a caption to ask the selected coding tool about it.",
-    "/projects -> list configured projects",
-    "/threads -> list named relay sessions in the active project",
+    "/threads -> list named relay slots in the selected directory",
     "/thread <name> -> select or create a named session (main is the original session)",
-    "/in <project>/<name> <prompt> -> run in a named session without switching",
-    "/status, /stop, /approve, /deny, /sessions and /session also accept project/name targets.",
+    "/in <directory-alias>/<name> <prompt> -> run in a named session without switching",
+    "/status, /stop, /approve, /deny, /sessions and /session also accept directory-alias/name targets.",
     "Named sessions can run concurrently in the same workspace. Their file edits can conflict; no worktree is created automatically.",
-    "/project -> show the active project for this chat",
-    "/project <number|alias|project hint|path hint> -> switch this chat to another project, letting Codex resolve natural project hints against existing projects before auto-adding a repo from a path",
-    "/status or /st [project] -> show the current project session or another project's session",
-    "/new or /n [prompt] -> start a fresh session in the active project, optionally with a first prompt",
-    "/in <project> <prompt> -> send a one-off prompt to another project without switching",
-    "/btw <prompt> -> ask a disposable side question and then return to your current project",
-    "/sessions or /ls [project] -> list recent native sessions for a project with /1, /2, ... shortcuts",
-    "/session [project] <n|thread-id-prefix>, /connect <...>, /c <...>, or /1 -> attach a native session to the selected relay thread",
+    "/new or /n [prompt] -> start a fresh session in the selected directory",
+    "/in <directory-alias> <prompt> -> one-off prompt without switching",
+    "/btw <prompt> -> disposable side question",
+    "/sessions <alias/name> and /session <alias/name> <number|id-prefix> retain scoped slot attachment without switching",
+    "Legacy /project and /projects commands remain available for directory aliases and natural path hints.",
     "/permissions or /p [project] [ro|ww|dfa] -> inspect or change read-only, workspace-write, or danger-full-access",
     "/ro, /ww, /dfa -> quick permission switch for the active project",
     "/voice [status|on|off] [1x|2x] -> inspect or change voice reply mode for this chat",
@@ -378,7 +412,7 @@ function helpText() {
     "/stop or /x [project|btw] -> stop an in-flight Codex run",
     "/help or /h -> show this help",
     "",
-    "Any other text in this direct chat continues the selected named session in the active project.",
+    "Any other text continues the selected session. Saved sessions are not necessarily running.",
     "If that same named session or /btw scope is already busy, prompt-like follow-ups queue automatically and run in order.",
     `Voice notes are transcribed locally with ${DEFAULT_TRANSCRIPTION_MODEL}.`,
     "Short spoken commands are supported for help, status, stop, and new session.",
@@ -665,6 +699,7 @@ export function parseIncomingCommand(text, captureAllDirectMessages) {
       case "files":
         return { type: normalizedCommand };
       case "host":
+      case "directory":
       case "sendFile":
         return { type: normalizedCommand, payload };
       case "help":
@@ -1502,8 +1537,9 @@ export class WhatsAppControllerBridge {
   nativeThreadBusy(project, nativeThreadId, exceptKey = null) {
     if (!nativeThreadId) return false;
     const bindingKey = projectBindingKey(this.configStore.data, project);
+    const connectionKey = providerConnectionKey(this.configStore.data, project);
     return [...this.activeRuns.entries()].some(([key, run]) => key !== exceptKey &&
-      run.bindingKey === bindingKey && run.threadId === nativeThreadId);
+      (run.providerConnectionKey ? run.providerConnectionKey === connectionKey : run.bindingKey === bindingKey) && run.threadId === nativeThreadId);
   }
 
   async handleNamedThreadCommand({ phoneKey, remoteJid, payload = "" }) {
@@ -1533,7 +1569,7 @@ export class WhatsAppControllerBridge {
         const run = this.projectRun(phoneKey, project.alias, name);
         return `${name === selected ? "* " : ""}${name}: ${run ? "running" : "idle"}; native=${shortThreadId(slot.threadId)}; queued=${slot.queuedPrompts?.length ?? 0}`;
       }),
-      "Use /thread <name> to select/create one; /sessions lists native sessions to attach to the selected slot.",
+      `Use /thread <name> to select/create a slot; /sessions browses this computer. Use /sessions ${project.alias}/<name> for scoped attachment.`,
       "Named sessions share the project workspace; concurrent file edits can conflict."
     ];
     await this.sendReply(remoteJid, lines.join("\n"));
@@ -1558,6 +1594,7 @@ export class WhatsAppControllerBridge {
   async upsertChatSession(phoneKey, partial = {}) {
     await this.stateStore.mutateSession(phoneKey, (current) => {
       const btw = partial.btw ? { ...current.btw, ...partial.btw } : current.btw;
+      invalidateChangedSelection(current, partial);
       Object.assign(current, partial, { phoneKey, btw });
     });
   }
@@ -1568,6 +1605,7 @@ export class WhatsAppControllerBridge {
       const projectState = current.projects[projectAlias] ??= defaultProjectSession();
       const slot = projectThreadSession(projectState, selectedThread, true);
       if (guard && !guard(slot)) return false;
+      invalidateChangedSelection(current, chatPatch);
       Object.assign(current, chatPatch, { phoneKey });
       Object.assign(slot, projectPatch);
       return true;
@@ -2386,6 +2424,9 @@ export class WhatsAppControllerBridge {
       case "host":
         await this.handleHostCommand({ phoneKey, remoteJid, payload: command.payload });
         return;
+      case "directory":
+        await this.handleDirectoryCommand({ phoneKey, remoteJid, payload: command.payload, label });
+        return;
       case "files":
         await this.handleFilesCommand({ phoneKey, remoteJid });
         return;
@@ -2648,13 +2689,229 @@ export class WhatsAppControllerBridge {
     await this.sendReply(remoteJid, this.renderProjectList(phoneKey));
   }
 
+  hostBrowserScope(phoneKey) {
+    const chat = this.getChatSession(phoneKey);
+    const host = resolveHost(this.configStore.data, this.getActiveProject(phoneKey).host ?? "host");
+    return { host, directory: chat.directoryFilter ?? null,
+      key: JSON.stringify([host, chat.directoryFilter ?? null, chat.browserRevision ?? 0]) };
+  }
+
+  discoverySources(hostId) {
+    const config = this.configStore.data;
+    const sources = new Map();
+    for (const project of config.projects.filter((item) => (item.host ?? "host") === hostId)) {
+      const key = discoverySourceKey(config, project);
+      if (!sources.has(key)) sources.set(key, project);
+    }
+    return [...sources.values()];
+  }
+
+  relayHasNativeRun(item) {
+    return [...this.activeRuns.values()].some((run) => run.providerConnectionKey === item.connectionKey && run.threadId === item.id);
+  }
+
+  async discoverHostSessions(phoneKey) {
+    const scope = this.hostBrowserScope(phoneKey);
+    const config = this.configStore.data;
+    const sources = this.discoverySources(scope.host.id);
+    const results = await Promise.allSettled(sources.map((source) => this.runner.listCodexThreads({
+      ...this.runnerOptions(source), scope: scope.directory ? "workspace" : "host", workspace: scope.directory ?? source.workspace, limit: HOST_SESSION_LIMIT
+    })));
+    const choices = new Map(), errors = [];
+    for (let i = 0; i < results.length; i++) {
+      const source = sources[i], result = results[i];
+      if (result.status === "rejected") {
+        errors.push(`${source.engine ?? "codex"} (${source.alias}): ${result.reason?.message ?? String(result.reason)}`);
+        continue;
+      }
+      for (const item of result.value.slice(0, HOST_SESSION_LIMIT)) {
+        let cwd;
+        try { cwd = normalizeDirectoryPath(item.cwd ?? item.workspace, scope.host); }
+        catch { continue; }
+        if (!item.id || (scope.directory && directoryPathKey(cwd, scope.host) !== directoryPathKey(scope.directory, scope.host))) continue;
+        const connectionKey = providerConnectionKey(config, source);
+        const exact = config.projects.find((project) => providerConnectionKey(config, project) === connectionKey &&
+          directoryPathKey(project.workspace, scope.host) === directoryPathKey(cwd, scope.host));
+        const selectedSource = exact ?? source;
+        const choice = { id: item.id, cwd, engine: source.engine ?? "codex", name: item.name ?? item.title ?? null,
+          preview: sanitizeThreadPreview(item.preview), updatedAt: item.updatedAt ?? null,
+          status: typeof item.status === "string" ? item.status : item.status?.type ?? null,
+          sourceAlias: selectedSource.alias, sourceKey: discoverySourceKey(config, selectedSource), connectionKey };
+        const choiceKey = JSON.stringify([connectionKey, item.id, directoryPathKey(cwd, scope.host)]);
+        const previous = choices.get(choiceKey);
+        const readOnly = (alias) => resolveSessionPermissionLevel(config, config.projects.find((project) => project.alias === alias), {}) === "read-only";
+        if (!previous || exact || (readOnly(choice.sourceAlias) && !readOnly(previous.sourceAlias))) choices.set(choiceKey, choice);
+      }
+    }
+    const rows = [...choices.values()].sort((a, b) => {
+      const time = (value) => Date.parse(formatThreadTimestamp(value)) || 0;
+      const activity = (item) => Number(this.relayHasNativeRun(item) || item.status === "active");
+      return activity(b) - activity(a) || time(b.updatedAt) - time(a.updatedAt) || String(a.id).localeCompare(String(b.id));
+    });
+    return { scopeKey: scope.key, hostId: scope.host.id, directory: scope.directory,
+      createdAt: new Date().toISOString(), choices: rows, errors, shown: 0 };
+  }
+
+  validHostBrowser(phoneKey) {
+    const browser = this.getChatSession(phoneKey).hostSessionBrowser;
+    return browser && browser.scopeKey === this.hostBrowserScope(phoneKey).key &&
+      Date.now() - Date.parse(browser.createdAt) < THREAD_SHORTCUT_TTL_MS ? browser : null;
+  }
+
+  async sendHostSessionList(phoneKey, remoteJid, more = false) {
+    let browser = more ? this.validHostBrowser(phoneKey) : await this.discoverHostSessions(phoneKey);
+    if (!browser || browser.scopeKey !== this.hostBrowserScope(phoneKey).key) {
+      return this.sendReply(remoteJid, "The computer or directory changed, or the numbered list expired. Send /sessions for a fresh list.");
+    }
+    const start = more ? browser.shown : 0;
+    const page = browser.choices.slice(start, start + SESSION_LIST_LIMIT);
+    browser = { ...browser, shown: start + page.length };
+    const saved = await this.stateStore.mutateSession(phoneKey, (chat) => {
+      if (browser.scopeKey !== this.hostBrowserScope(phoneKey).key) return false;
+      chat.hostSessionBrowser = browser;
+      chat.legacySessionChoiceScope = null;
+      return true;
+    });
+    if (!saved) return this.sendReply(remoteJid, "The computer or directory changed. Send /sessions again.");
+    await this.sendReply(remoteJid, [
+      `Saved sessions on ${browser.hostId}${browser.directory ? ` in ${browser.directory}` : " across directories"}:`,
+      ...page.map((item, index) => [
+        `${start + index + 1}. ${item.engine} — ${item.name || shortThreadId(item.id)}`,
+        `  Directory: ${item.cwd}`,
+        `  id: ${shortThreadId(item.id)}${item.updatedAt ? ` | updated: ${formatThreadTimestamp(item.updatedAt)}` : ""}`,
+        this.relayHasNativeRun(item) ? "  Activity: running in this relay" :
+          item.status === "active" ? "  Activity: tool reports active" : "  Activity: saved; running status unconfirmed"
+      ].join("\n")),
+      page.length ? `Select /session <number> or /<number>; its engine and directory are selected automatically.` :
+        (start ? "No more saved sessions in this list." : "No saved sessions found in this scope."),
+      browser.shown < browser.choices.length ? "Use /sessions more for the next page." : null,
+      `Showing a recent, bounded search (up to ${HOST_SESSION_LIMIT} sessions per configured provider). Saved does not mean running.`,
+      ...browser.errors.map((error) => `Could not search ${error}`),
+      "Use /dir <alias or absolute path> to narrow directories, /dir all to clear the filter, or /host <id> to change computer."
+    ].filter(Boolean).join("\n"));
+  }
+
+  async ensureDirectoryRoute(source, cwd, expectedSourceKey) {
+    let alias;
+    await this.configStore.mutate((config) => {
+      const currentSource = config.projects.find((project) => project.alias === source.alias);
+      if (!currentSource || discoverySourceKey(config, currentSource) !== expectedSourceKey) throw new Error("The provider configuration changed. Send /sessions again.");
+      const host = resolveHost(config, source.host ?? "host");
+      const connectionKey = providerConnectionKey(config, currentSource);
+      const existing = config.projects.find((project) => providerConnectionKey(config, project) === connectionKey &&
+        directoryPathKey(project.workspace, host) === directoryPathKey(cwd, host));
+      if (existing) { alias = existing.alias; return; }
+      const base = normalizeProjectAlias(`dir-${host.id}-${source.engine ?? "codex"}-${createHash("sha256").update(connectionKey + cwd).digest("hex").slice(0, 10)}`);
+      alias = base;
+      for (let index = 2; config.projects.some((project) => project.alias === alias); index++) alias = `${base}-${index}`;
+      const permission = resolveSessionPermissionLevel(config, currentSource, {});
+      config.projects.push({ ...currentSource, alias, workspace: cwd,
+        permissionLevel: (source.engine ?? "codex") === "codex" ? (permission === "read-only" ? "read-only" : "workspace-write") : "native" });
+    });
+    return this.configStore.data.projects.find((project) => project.alias === alias);
+  }
+
+  async handleDirectoryCommand({ phoneKey, remoteJid, payload, label }) {
+    const spec = String(payload ?? "").trim();
+    const source = this.getActiveProject(phoneKey);
+    const host = resolveHost(this.configStore.data, source.host ?? "host");
+    if (!spec) return this.sendReply(remoteJid, [
+      `Computer: ${host.id}`, `Directory: ${source.workspace}`, `Engine: ${source.engine ?? "codex"}`,
+      `Session-list filter: ${this.getChatSession(phoneKey).directoryFilter ?? "all directories"}`,
+      "Use /dir <alias or absolute path>, /dir all, or /dirs to list known directories."
+    ].join("\n"));
+    if (spec.toLowerCase() === "all") {
+      await this.upsertChatSession(phoneKey, { directoryFilter: null });
+      return this.sendReply(remoteJid, `Session lists now search across directories on ${host.id}. Send /sessions. Your selected session is unchanged.`);
+    }
+    try {
+      const aliasMatch = this.configStore.data.projects.find((project) => project.alias === spec && (project.host ?? "host") === host.id);
+      const project = aliasMatch ?? await this.ensureDirectoryRoute(source, normalizeDirectoryPath(spec, host), discoverySourceKey(this.configStore.data, source));
+      await this.upsertChatSession(phoneKey, { activeProject: project.alias, directoryFilter: project.workspace, label, remoteJid });
+      await this.sendReply(remoteJid, `Selected directory ${project.workspace} on ${host.id} (${project.engine ?? "codex"}). Use /sessions to find saved sessions here, or /new <prompt> to start one.`);
+    } catch (error) {
+      await this.sendReply(remoteJid, `Could not select directory: ${error.message}`);
+    }
+  }
+
+  async connectHostSession({ phoneKey, remoteJid, selector, label }) {
+    const browser = this.validHostBrowser(phoneKey);
+    if (!browser) return this.sendReply(remoteJid, "The numbered session list is missing, expired, or belongs to another computer/directory. Send /sessions before selecting a session.");
+    const token = String(selector).trim();
+    const number = /^\/?\d+$/.test(token) ? Number(token.replace(/^\//, "")) : null;
+    const matches = number !== null
+      ? (number > 0 && number <= browser.shown ? [browser.choices[number - 1]] : [])
+      : browser.choices.filter((item) => item.id === token || item.id.startsWith(token) || item.name?.toLowerCase() === token.toLowerCase());
+    if (matches.length !== 1) return this.sendReply(remoteJid, matches.length
+      ? "That ID or name matches more than one tool or provider. Select its numbered entry with /session <number>."
+      : "No session matches that selection in the displayed list. Use /sessions or /sessions more.");
+    const choice = matches[0];
+    try {
+      const config = this.configStore.data;
+      const source = config.projects.find((project) => project.alias === choice.sourceAlias);
+      if (!source || discoverySourceKey(config, source) !== choice.sourceKey) throw new Error("The provider configuration changed. Send /sessions again.");
+      const host = resolveHost(config, source.host ?? "host");
+      const fresh = await this.runner.listCodexThreads({ ...this.runnerOptions(source), scope: "workspace", workspace: choice.cwd, limit: HOST_SESSION_LIMIT });
+      const stillPresent = fresh.some((item) => {
+        try { return item.id === choice.id && directoryPathKey(item.cwd ?? item.workspace, host) === directoryPathKey(choice.cwd, host); }
+        catch { return false; }
+      });
+      if (!stillPresent) throw new Error("That saved session moved, disappeared, or left the recent search window. Send /sessions again.");
+      if (browser.scopeKey !== this.hostBrowserScope(phoneKey).key) throw new Error("The computer or directory changed while checking the session. Send /sessions again.");
+      const project = await this.ensureDirectoryRoute(source, choice.cwd, choice.sourceKey);
+      const bindingKey = projectBindingKey(this.configStore.data, project);
+      const routeSourceKey = discoverySourceKey(this.configStore.data, project);
+      let selectedName;
+      const attached = await this.stateStore.mutateSession(phoneKey, (chat) => {
+        const currentProject = this.configStore.data.projects.find((item) => item.alias === project.alias);
+        if (browser.scopeKey !== this.hostBrowserScope(phoneKey).key ||
+          !currentProject || projectBindingKey(this.configStore.data, currentProject) !== bindingKey ||
+          discoverySourceKey(this.configStore.data, currentProject) !== routeSourceKey) return false;
+        const state = chat.projects[project.alias] ??= defaultProjectSession();
+        const names = [DEFAULT_THREAD_NAME, ...Object.keys(state.namedThreads ?? {})];
+        const same = names.find((name) => {
+          const slot = projectThreadSession(state, name);
+          return slot.threadId === choice.id && (!slot.bindingKey || slot.bindingKey === bindingKey);
+        });
+        const available = names.find((name) => {
+          const slot = projectThreadSession(state, name);
+          return !slot.threadId && !slot.queuedPrompts?.length && !slot.pendingApproval && !this.projectRun(phoneKey, project.alias, name);
+        });
+        selectedName = same ?? available;
+        if (!selectedName) {
+          const base = `s-${createHash("sha256").update(choice.id).digest("hex").slice(0, 12)}`;
+          selectedName = base;
+          for (let suffix = 2; names.includes(selectedName); suffix++) selectedName = `${base}-${suffix}`;
+        }
+        const ownRun = same ? this.projectRun(phoneKey, project.alias, selectedName) : null;
+        const ownRunKey = ownRun ? [...this.activeRuns.entries()].find(([, run]) => run === ownRun)?.[0] : null;
+        if (this.nativeThreadBusy(project, choice.id, ownRunKey)) return false;
+        const slot = projectThreadSession(state, selectedName, true);
+        if (!same) Object.assign(slot, { threadId: choice.id, bindingKey, connectedThreadAt: new Date().toISOString(), connectedThreadName: choice.name });
+        else if (!slot.bindingKey) slot.bindingKey = bindingKey;
+        state.activeThread = selectedName;
+        Object.assign(chat, { activeProject: project.alias, remoteJid, label });
+        return true;
+      });
+      if (!attached) throw new Error("The destination changed or that native session is running in another relay slot. Refresh /sessions after it finishes.");
+      await this.sendReply(remoteJid, [
+        `Selected session ${choice.name || shortThreadId(choice.id)}.`,
+        `Computer: ${host.id} | tool: ${choice.engine}`, `Directory: ${project.workspace}`,
+        `Session: ${choice.id}`, `Permissions: ${resolveSessionPermissionLevel(this.configStore.data, project, this.getProjectSession(phoneKey, project.alias, selectedName).session)}`,
+        "Send a normal message to continue here. Messages and uploads use this directory."
+      ].join("\n"));
+    } catch (error) {
+      await this.sendReply(remoteJid, `Could not select session on ${browser.hostId}: ${error.message}`);
+    }
+  }
+
   renderHostList(phoneKey) {
     const config = this.configStore.data;
     const active = this.getActiveProject(phoneKey);
     return ["Machines:", ...normalizeHosts(config).map((host) => {
       const projects = config.projects.filter((project) => (project.host ?? "host") === host.id);
-      return `${host.id}${(active.host ?? "host") === host.id ? " (active)" : ""}: ${projects.map((p) => p.alias).join(", ") || "no projects configured"}`;
-    }), "Use /host <id> [project] to select a machine."].join("\n");
+      return `${host.id}${(active.host ?? "host") === host.id ? " (active)" : ""}: ${[...new Set(projects.map((p) => p.engine ?? "codex"))].join(", ") || "codex"}`;
+    }), "Use /host <id>, then /sessions to browse saved sessions across directories."].join("\n");
   }
 
   async handleHostCommand({ phoneKey, remoteJid, payload }) {
@@ -2666,14 +2923,29 @@ export class WhatsAppControllerBridge {
     const projects = config.projects.filter((project) => (project.host ?? "host") === host.id);
     const token = projectParts.join(" ");
     const current = this.getActiveProject(phoneKey);
-    const project = token
+    let project = token
       ? projects.find((candidate) => candidate.alias === token)
       : projects.find((candidate) => candidate.alias === current.alias) ?? projects[0];
-    if (!project) {
-      return this.sendReply(remoteJid, `No matching project on ${host.id}. Configured projects: ${projects.map((p) => p.alias).join(", ") || "none"}.`);
+    if (!project && !token) {
+      const workspace = host.transport === "ssh" ? (host.platform === "win32" ? path.win32 : path.posix).dirname(host.workerPath) : config.workspace;
+      let alias;
+      await this.configStore.mutate((latest) => {
+        const existing = latest.projects.find((item) => (item.host ?? "host") === host.id);
+        if (existing) { alias = existing.alias; return; }
+        const base = normalizeProjectAlias(`dir-${host.id}-default`);
+        alias = base;
+        for (let suffix = 2; latest.projects.some((item) => item.alias === alias); suffix++) alias = `${base}-${suffix}`;
+        const permission = resolveSessionPermissionLevel(latest, { engine: "codex" }, {});
+        latest.projects.push({ alias, host: host.id, engine: "codex", workspace,
+          permissionLevel: permission === "read-only" ? "read-only" : "workspace-write" });
+      });
+      project = this.configStore.data.projects.find((item) => item.alias === alias && item.host === host.id);
     }
-    await this.upsertChatSession(phoneKey, { activeProject: project.alias });
-    await this.sendReply(remoteJid, `Selected ${host.id} / ${project.alias}. Messages and uploads now target this workspace. Use /sessions to choose an existing session, or /new <prompt>.`);
+    if (!project) {
+      return this.sendReply(remoteJid, `No matching directory on ${host.id}. Known aliases: ${projects.map((p) => p.alias).join(", ") || "none"}.`);
+    }
+    await this.upsertChatSession(phoneKey, { activeProject: project.alias, directoryFilter: null });
+    await this.sendReply(remoteJid, `Selected computer ${host.id}. Send /sessions to browse saved sessions across directories. Current directory: ${project.workspace} (${project.engine ?? "codex"}).`);
   }
 
   fileOptions(project) {
@@ -2751,12 +3023,11 @@ export class WhatsAppControllerBridge {
 
   renderProjectList(phoneKey) {
     const config = this.configStore.data;
-    const chatSession = this.getChatSession(phoneKey);
     const activeProject = this.getActiveProject(phoneKey);
     const lines = [
-      "Projects:",
+      `Known directories on ${activeProject.host ?? "host"}:`,
       "",
-      ...config.projects.flatMap((project, index) => {
+      ...config.projects.filter((project) => (project.host ?? "host") === (activeProject.host ?? "host")).flatMap((project) => {
         const projectSession = this.getProjectSession(phoneKey, project.alias).session;
         const run = this.projectRun(phoneKey, project.alias);
         const permissionLevel = resolveSessionPermissionLevel(
@@ -2764,14 +3035,12 @@ export class WhatsAppControllerBridge {
           project,
           projectSession
         );
-        return summarizeProjectChoice(project, projectSession, run, permissionLevel, {
-          activeProjectAlias: activeProject.alias,
-          index: index + 1
-        });
+        return [`${project.alias}${project.alias === activeProject.alias ? " (selected)" : ""}: ${project.engine ?? "codex"}`,
+          `  ${project.workspace}`, `  session: ${shortThreadId(projectSession.threadId)} | permissions: ${permissionLevel}${run ? " | running in this relay" : ""}`];
       }).filter(Boolean),
       "",
-      "Quick switch: /project 1, /project 2, ...",
-      ...projectHelpFooter()
+      "Select /dir <alias>, or use /sessions to discover sessions without directory setup.",
+      "Use /host <id> for another computer. Legacy /project and /projects remain supported."
     ];
 
     if (this.btwRun(phoneKey)) {
@@ -2794,7 +3063,8 @@ export class WhatsAppControllerBridge {
       await this.sendReply(
         remoteJid,
         [
-          `You are in project ${activeProject.alias}.`,
+          `Computer: ${activeProject.host ?? "host"} | tool: ${activeProject.engine ?? "codex"}`,
+          `Directory: ${activeProject.workspace}`,
           `session: ${shortThreadId(session.threadId ?? null)}`,
           `permissions: ${permissionLevel}`,
           "",
@@ -2840,19 +3110,15 @@ export class WhatsAppControllerBridge {
       phoneKey,
       remoteJid,
       label,
-      activeProject: project.alias
+      activeProject: project.alias,
+      directoryFilter: null
     });
 
     await this.sendReply(
       remoteJid,
       [
-        ensured.created
-          ? `Added project ${project.alias} and switched this chat to it.`
-          : ensured.shortcutIndex
-            ? `Switched this chat to project ${project.alias} via ${formatProjectShortcut(
-                ensured.shortcutIndex
-              )}.`
-            : `Switched this chat to project ${project.alias}.`,
+        `Computer: ${project.host ?? "host"} | tool: ${project.engine ?? "codex"}`,
+        `Selected directory: ${project.workspace}`,
         `session: ${shortThreadId(session.threadId ?? null)}`,
         `permissions: ${permissionLevel}`,
         "",
@@ -2918,7 +3184,8 @@ export class WhatsAppControllerBridge {
       const btw = this.btwRun(phoneKey);
       return [
         "WhatsApp Codex bridge",
-        `active_project: ${activeProject.alias}`,
+        `computer: ${activeProject.host ?? "host"}`,
+        `directory: ${activeProject.workspace}`,
         "target: btw",
         `busy: ${btw ? "yes" : "no"}`,
         `queued_messages: ${this.queuedPromptCount(phoneKey, { scopeType: "btw" })}`,
@@ -2942,10 +3209,10 @@ export class WhatsAppControllerBridge {
 
     return [
       "WhatsApp Codex bridge",
-      `active_project: ${activeProject.alias}`,
-      `project: ${project.alias}`,
-      `host: ${project.host ?? "host"}`,
-      `engine: ${project.engine ?? "codex"}`,
+      `computer: ${project.host ?? "host"}`,
+      `tool: ${project.engine ?? "codex"}`,
+      `directory: ${project.workspace}`,
+      `directory_alias: ${project.alias}`,
       `relay_thread: ${threadName}`,
       `session: ${shortThreadId(projectSession.threadId ?? null)}`,
       `busy: ${activeRun ? "yes" : "no"}`,
@@ -2967,13 +3234,16 @@ export class WhatsAppControllerBridge {
       projectSession.lastPromptAt ? `last_prompt_at: ${projectSession.lastPromptAt}` : null,
       projectSession.lastReplyAt ? `last_reply_at: ${projectSession.lastReplyAt}` : null,
       "",
-      "Commands: /project, /in, /btw, /n, /ls, /session, /p, /ro, /ww, /dfa, /voice, /x, /h"
+      "Commands: /host, /dir, /sessions, /session, /in, /new, /p, /voice, /stop, /help"
     ]
       .filter(Boolean)
       .join("\n");
   }
 
   async sendThreadList(phoneKey, remoteJid, payload = "") {
+    if (!String(payload).trim() || String(payload).trim().toLowerCase() === "more") {
+      return this.sendHostSessionList(phoneKey, remoteJid, String(payload).trim().toLowerCase() === "more");
+    }
     const config = this.configStore.data;
     const target = parseProjectTargetPayload(payload, config);
     if (target.targetType === "ambiguous") {
@@ -3023,6 +3293,11 @@ export class WhatsAppControllerBridge {
       }
     });
 
+    await this.stateStore.mutateSession(phoneKey, (chat) => {
+      chat.hostSessionBrowser = null;
+      chat.legacySessionChoiceScope = { scopeKey: this.hostBrowserScope(phoneKey).key, projectAlias: project.alias, threadName };
+    });
+
     const isActive = this.isActiveProjectSession(phoneKey, project.alias, threadName);
     const sessionTarget = `${project.alias}/${threadName}`;
     const lines = [
@@ -3068,6 +3343,15 @@ export class WhatsAppControllerBridge {
   async connectToThread({ phoneKey, remoteJid, payload, label }) {
     const config = this.configStore.data;
     const parsed = parseConnectPayload(payload, config);
+    if (!parsed.projectAlias && !parsed.invalidTarget && !parsed.ambiguousProjects?.length) {
+      const chat = this.getChatSession(phoneKey);
+      const legacy = chat.legacySessionChoiceScope;
+      const legacyMatches = legacy?.scopeKey === this.hostBrowserScope(phoneKey).key &&
+        this.isActiveProjectSession(phoneKey, legacy.projectAlias, legacy.threadName);
+      if (chat.hostSessionBrowser || (/^\/?\d+$/.test(String(parsed.selector ?? "").trim()) && !legacyMatches)) {
+        return this.connectHostSession({ phoneKey, remoteJid, selector: parsed.selector, label });
+      }
+    }
     if (parsed.invalidTarget && !parsed.ambiguousProjects?.length) {
       await this.sendReply(remoteJid, "Unknown project/thread target. Use /projects and /threads to inspect destinations.");
       return;
@@ -3800,6 +4084,7 @@ export class WhatsAppControllerBridge {
 
     activeRun = {
       bindingKey,
+      providerConnectionKey: providerConnectionKey(this.configStore.data, project),
       child,
       interrupt,
       answerApproval,

@@ -773,8 +773,11 @@ export async function listCodexThreads({
   model = null,
   profile = null,
   search = false,
+  scope = "workspace",
   limit = 20
 }) {
+  if (!["workspace", "host"].includes(scope)) throw new Error("Codex session scope must be workspace or host.");
+  const resultLimit = Math.max(1, Math.min(200, Math.trunc(Number(limit)) || 20));
   const hostPlatform = host?.platform ?? process.platform;
   const paths = hostPlatform === "win32" || hostPlatform === "windows" ? path.win32 : path.posix;
   if (typeof workspace !== "string" || !paths.isAbsolute(workspace)) {
@@ -807,15 +810,35 @@ export async function listCodexThreads({
 
     await client.notify("initialized");
 
-    const result = await client.request("thread/list", {
-      cursor: null,
-      limit,
-      sortKey: "updated_at",
-      cwd,
-      sourceKinds: ["cli", "vscode", "exec", "appServer"]
-    });
-
-    return result.data ?? [];
+    const threads = [];
+    const ids = new Set();
+    const cursors = new Set();
+    let cursor = null;
+    // Native pagination is required because app-server may return fewer rows
+    // than requested. Never turn a host query into a scan of transcript files.
+    for (let page = 0; page < 10; page++) {
+      const result = await client.request("thread/list", {
+        cursor,
+        limit: Math.min(100, resultLimit),
+        sortKey: "updated_at",
+        ...(scope === "host" ? {} : { cwd }),
+        sourceKinds: ["cli", "vscode", "exec", "appServer"]
+      });
+      if (!Array.isArray(result.data)) throw new Error("Codex returned an invalid session list.");
+      for (const thread of result.data) {
+        if (typeof thread.id !== "string" || !thread.id || ids.has(thread.id) ||
+            typeof thread.cwd !== "string" || /[\x00-\x1f\x7f]/.test(thread.cwd) || !paths.isAbsolute(thread.cwd) ||
+            (paths === path.win32 && !/^(?:[a-z]:\\|\\\\[^\\]+\\[^\\]+\\)/i.test(paths.normalize(thread.cwd)))) continue;
+        ids.add(thread.id);
+        threads.push(thread);
+        if (threads.length === resultLimit) return threads;
+      }
+      cursor = result.nextCursor;
+      if (!cursor) return threads;
+      if (typeof cursor !== "string" || cursors.has(cursor)) throw new Error("Codex session pagination returned an invalid or repeated cursor.");
+      cursors.add(cursor);
+    }
+    throw new Error("Codex session discovery exceeded its 10-page scan limit. Retry with a smaller result limit or workspace scope.");
   } finally {
     await client.shutdown().catch(() => {});
     await client.closed.catch(() => {});

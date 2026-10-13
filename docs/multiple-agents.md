@@ -1,13 +1,13 @@
 # Named sessions and coding tools
 
-One gateway can address multiple machines, coding tools, projects and named conversations. Each configured project selects a machine and an engine (`codex`, `opencode`, or `claude`). Named relay threads select independent native conversations within that project. The same workspace can be configured once per engine.
+One gateway can address multiple computers, coding tools and conversations. Start with `/host <id>`, `/sessions`, then `/session <number>`: the selected native conversation supplies its directory and engine (`codex`, `opencode`, or `claude`). `/dir <path or shortcut>` optionally narrows discovery; `/dir all` clears the filter. The configuration retains the `projects` field for directory/tool routes and backward compatibility.
 
 ## Parallel conversations
 
 Existing project conversations migrate to the `main` thread. Their native session IDs are preserved. These commands create or select additional threads:
 
 ```text
-/project pc-code
+/dir pc-code
 /thread review
 Review the error handling in this repository
 /thread tests
@@ -16,7 +16,7 @@ Find missing tests for the parser
 /in vm-code/review Review the latest changes
 ```
 
-`/thread <name>` creates an empty named thread if necessary and selects it; its first prompt creates a native session. Names use letters, numbers, underscores or hyphens. `/threads` lists the relay's named threads. `/sessions` still lists saved native conversations on the selected machine, engine and workspace; `/session 1` attaches one to the selected relay thread. Switching named threads does not stop other runs. Plain text and file captions go to the selected thread. `/in <project>/<thread> <prompt>` addresses another thread without switching.
+`/thread <name>` creates an empty named thread if necessary and selects it; its first prompt creates a native session. Names use letters, numbers, underscores or hyphens. `/threads` lists the relay's named threads. `/sessions` browses native conversations across the selected computer, or within an optional directory filter; `/session 1` selects a listed conversation and its directory/engine. Switching conversations does not stop other runs. Plain text and file captions go to the selected thread. `/in <directory-shortcut>/<thread> <prompt>` addresses another thread without switching.
 
 Each thread has its own pending messages, permissions, native ID and run state. `/status <project>/<thread>` and `/stop <project>/<thread>` target it explicitly. Bare `/approve`, `/deny`, and `/cancel` apply to the currently selected thread, even when other runs are waiting. Use an explicit target such as `/approve pc-code/review` to answer another thread's request; each approval message includes its target. The relay refuses to run the same native session simultaneously through two slots it controls. Other clients remain independent: finish their current turn before resuming that native session through WhatsApp.
 
@@ -24,7 +24,7 @@ Parallel conversations in one folder share its files. Use separate worktrees/pro
 
 ## Engine configuration
 
-See [the multi-engine example](../examples/controller-config.multi-engine.json). Configure each engine's project explicitly. Unspecified engines remain Codex for compatibility. Codex's global model/profile settings are not applied to other engines.
+See [the multi-engine example](../examples/controller-config.multi-engine.json). Configure at least one source for each coding tool on each computer; discovered conversations supply additional directories automatically. Unspecified engines remain Codex for compatibility. Codex's global model/profile settings are not applied to other engines.
 
 ### Codex
 

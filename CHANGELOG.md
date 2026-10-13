@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Session browsing now starts with a computer: `/host` then `/sessions` discovers native conversations across directories and configured coding tools, with bounded paging and explicit partial errors.
+- Selecting a listed session automatically restores its directory and engine without replacing other active or queued conversations.
+- `/dir` and `/dirs` expose optional directory selection/filtering; legacy project commands and configuration remain compatible.
+- Host and directory changes invalidate numbered session choices; session activity labels distinguish known relay activity from saved native history.
+
+### Fixed
+
+- Claude session discovery verifies directory links with filesystem metadata, including Windows junctions misclassified by older Node.js directory listings.
+
 ## [0.6.1] - 2026-10-13
 
 ### Fixed

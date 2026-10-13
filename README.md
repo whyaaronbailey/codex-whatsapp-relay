@@ -16,31 +16,9 @@ $relayLauncher = (Resolve-Path ./scripts/launch.mjs).Path
 codex mcp add whatsapp-relay -- node $relayLauncher mcp
 ```
 
-For an existing checkout, fetch tags and select the same release on both machines after preserving local changes. Run one linked WhatsApp gateway on the PC and the worker on the VM. Use `/hosts`, `/host vm <project>`, `/sessions`, `/new`, `/files` and `/send <relative path>`. Documents, images and videos save into the selected workspace's `.whatsapp-relay/inbox`; exports get persistent outbox snapshots and hash manifests. Transfers are limited to 25 MiB each.
+For an existing checkout, fetch tags and select the same release on both machines after preserving local changes. Run one linked WhatsApp gateway on the PC and the worker on the VM. Use `/hosts`, `/host vm`, `/sessions`, `/session 1`, `/dir`, `/new`, `/files` and `/send <relative path>`. Documents, images and videos save into the selected workspace's `.whatsapp-relay/inbox`; exports get persistent outbox snapshots and hash manifests. Transfers are limited to 25 MiB each.
 
 The relay source is [MIT licensed](LICENSE). See [attribution and third-party licenses](THIRD_PARTY_NOTICES.md), [contribution guidance](CONTRIBUTING.md), and [security reporting](SECURITY.md). Dependencies retain their own licenses. This is an independent community project using Baileys, an unofficial WhatsApp integration; it is not affiliated with OpenAI or WhatsApp/Meta. The repository remains `private: true` in `package.json` only to prevent accidental npm publication; source releases are public on GitHub.
-
-The rest of this README documents the inherited relay features. Voice instructions describe the upstream platform-specific implementation, not validated Windows voice support.
-
-Put Codex in your WhatsApp.
-
-WhatsApp Relay is a Codex plugin that links a local WhatsApp account to Codex, lets Codex read and send WhatsApp messages, and can optionally let you control Codex from an allowed direct chat.
-
-The useful part is the mental model: scan a QR once, let the relay hold the WhatsApp session, and keep talking to Codex from your phone. Under the hood it uses `codex app-server`, so phone-controlled chats map to native Codex threads that can be resumed later in Codex and across WhatsApp messages.
-
-The controller bridge is now project-aware. One chat can keep `api` busy, switch to `web`, fire a one-shot prompt into another repo, and still ask a disposable `/btw` side question without losing the main thread.
-
-## What You Can Do
-
-- link your local WhatsApp account to Codex with one QR scan
-- read chats, inspect cached messages, sync history, and send WhatsApp replies from Codex
-- treat one allowed WhatsApp chat like a lightweight Codex client
-- keep multiple projects alive from one chat and switch between them without losing session state
-- target a different project with a one-off prompt while staying in your current project
-- jump between saved Codex sessions inside one project
-- approve, deny, stop, or lower permissions from WhatsApp
-- talk to Codex with voice notes and get local voice-note replies back
-- resume the same work later in your terminal with `codex resume`
 
 ## Install In Codex
 
@@ -76,249 +54,80 @@ Only set up the local checkout and MCP registration. Do not push, publish, or st
 1. Restart Codex.
 2. Verify that the `whatsapp-relay` MCP tools are available.
 3. Ask Codex to link your WhatsApp account and verify the authentication status.
-4. Configure your controller allowlist and host/project destinations using the setup guide before starting phone control.
+4. Configure your controller allowlist and computers and coding tools using the setup guide before starting phone control.
 
 The authentication flow shows a QR code for you to scan and verifies the session. If you want phone control, ask Codex to enable it after configuration. If you use the same WhatsApp account on your phone, `Message yourself` can be used as the control surface.
 
-## How It Works
+## Choose a computer, then a conversation
+
+Type these commands in **WhatsApp**, in your allowed direct chat or **Message yourself**:
 
 ```text
-                +----------------------+
-                |   Codex app-server   |
-                |   native threads     |
-                +----------+-----------+
-                           ^
-                           |
-Your phone <-> WhatsApp Relay daemon <-> WhatsApp session
+/hosts
+/host vm
+/sessions
+/session 1
+Continue where we left off
 ```
 
-1. Link a local WhatsApp session by scanning the QR shown in Codex output.
-2. Codex can inspect chats, read cached messages, sync history, and send replies through MCP tools.
-3. If you enable phone control, allowed direct chats continue a persistent `codex app-server` thread from WhatsApp.
+A **host** is a computer: your PC or VM. A **session** is a native conversation with Codex, OpenCode or Claude Code. Each session already knows its working directory. Selecting it automatically chooses the correct directory and coding tool; you do not need to register that folder first.
 
-## Multi-Project Mental Model
+`/sessions` searches across directories for the configured coding tools on the selected computer. The numbered list includes the tool and directory. It contains saved conversations as well as any sessions known to be working; it is not a list of open desktop windows. Activity is only labeled when the native tool or this relay can establish it. Discovery uses the operating-system account and native services configured for that computer.
+
+The list is bounded and paged for WhatsApp. Use `/sessions more` for another page of the current list. Refresh with `/sessions`; changing the computer or directory filter invalidates old numbered choices. A coding tool that cannot be reached is reported rather than silently hiding its sessions.
+
+## Directories are optional
+
+You can narrow discovery when you already know where you want to work:
 
 ```text
-One WhatsApp chat
-      |
-      +--> current project  -> sticky default lane
-      |        Example: /project alpha-app
-      |
-      +--> /in other-project ... -> one-shot lane
-      |        Does the work there, then leaves you where you were
-      |
-      +--> /btw ... -> disposable side thread
-               Never changes the current project or project session
+/dir C:\Work\My Repository
+/sessions
+/dir all
+/sessions
 ```
 
-```text
-You are in project-a
-      |
-      +--> project-b is still running in the background
-      |
-      +--> project-b finishes
-               |
-               +--> relay posts a completion message
-                    and reminds you that you are still in project-a
-```
+`/dir` shows the current working directory and listing filter. `/dirs` lists configured directory shortcuts; `/dir <shortcut>` selects one. An absolute path uses the selected computer and current coding tool. `/dir all` clears the listing filter while keeping the current conversation available. Selecting a computer with `/host` also resets the directory filter.
 
-## Try It
+For a new conversation, choose a directory and send `/new <prompt>`. Files you upload, and files you return with `/send`, use the selected conversation's directory.
 
-- "Link my WhatsApp account and verify the auth status."
-- "Show my unread WhatsApp chats."
-- "Send a WhatsApp message to Alice saying I'll be there in 10 minutes."
-- "Allow my number and start WhatsApp Relay so I can control Codex from WhatsApp."
-- "Start new session in alpha app inside code directory."
-- "/project alpha-app"
-- "/in alpha-app run the failing tests and explain the error"
-- "/btw what changed in GPT-5.4 reasoning modes?"
+The configuration file retains its older `projects`, `defaultProject` and `projectAlias` field names for compatibility. They describe directory/tool routes, not ChatGPT Projects. Existing `/project` and `/projects` commands remain supported; everyday use starts with computers and sessions.
 
-## Phone Commands
+## Phone commands
 
-Once the controller bridge is running, allowed direct chats can send:
+| Command | Action |
+| --- | --- |
+| `/hosts`, `/host <id>` | List or select a computer. |
+| `/sessions`, `/sessions more` | Browse native conversations across directories on that computer, or within an optional directory filter. |
+| `/session <number>`, `/1` | Continue a listed conversation with its directory and coding tool selected automatically. |
+| `/dir`, `/dirs`, `/dir <path or shortcut>`, `/dir all` | Inspect, select or clear the optional directory filter. |
+| `/new <prompt>` | Start a native conversation in the selected directory. |
+| `/status` | Show the selected session, computer, directory and relay run status. |
+| `/files`, `/send <relative path>` | List stored transfers or return a file from the selected directory. |
+| `/stop` | Stop the selected relay run and clear its queued follow-ups. |
+| `/approve`, `/deny`, `/cancel` | Answer a pending approval in the selected relay conversation. |
+| `/permissions`, `/ro`, `/ww`, `/dfa` | Inspect or change Codex permissions; full access requires a confirmation code. |
+| `/help` | Show command help. |
 
-- plain text to continue the active project's current Codex session
-- voice notes to continue the active project's current Codex session after local transcription
+Plain text and attachment captions continue the selected conversation. Another prompt for a busy relay conversation is queued. Switching conversations does not cancel background work or move queued prompts to the newly selected conversation.
 
-Project control:
+## Several conversations at once
 
-- `/projects` to list configured projects and show which one is active or busy
-- `/project` to inspect the active project for this chat
-- `/project <number|alias|project hint|path hint>` to switch to another project, letting Codex resolve natural project hints against the projects that already exist and auto-adding a repo when a path resolves locally
-- natural text like `start new session in alpha app inside code directory` to jump to a repo and start fresh there
-- `/new` or `/n` to start a fresh session in the active project
-- `/in <project> <prompt>` to send a one-shot prompt into another project without switching away
-- `/btw <prompt>` to ask a disposable side question and then return to your current project
+Named relay threads remain available for parallel work in one directory. `/thread review` and `/thread tests` create or select separate conversation slots; `/threads` lists those slots. These are distinct from `/sessions`, which browses the coding tool's saved conversations. See [named sessions and coding tools](docs/multiple-agents.md).
 
-Session control:
+Advanced commands still accept directory shortcuts and named threads: `/in pc-code/review <prompt>`, `/status pc-code/review`, `/stop pc-code/review`, or `/approve pc-code/review`. `/btw <prompt>` asks a disposable side question without changing your selected conversation. Background completions do not steal focus.
 
-- `/sessions` or `/ls [project]` to list recent Codex threads for a project
-- `/1`, `/2`, ... to jump to one of the most recently listed sessions
-- `/session <number|thread-id-prefix>` to switch the current project's session
-- `/session <project> <number|thread-id-prefix>` or `/c <...>` to switch another project's session directly
-- `/status` or `/st [project]` to inspect the active project session or another project's session, including the live run status and latest progress preview while a run is active
+## Files, accounts and permissions
 
-If you send another normal prompt while that same project or `/btw` scope is already busy, the relay now queues it, acknowledges that it was queued, and automatically runs it after the current task finishes unless you explicitly stop the active run. Stopping a scope also clears that scope's queued follow-ups so stale prompts do not linger.
+One gateway owns the WhatsApp connection. Use the existing native accounts, instruction files, Hindsight configuration and transcript collector on each computer. The relay adds no separate memory database.
 
-Permissions and approvals:
+Uploads are stored under `<directory>/.whatsapp-relay/inbox`; returned files are snapshotted under `.whatsapp-relay/outbox`. Transfers are capped at 25 MiB, preserve hash manifests, and reject traversal and credential exports. See [file storage and host setup](docs/host-vm.md).
 
-- `/permissions` or `/p [project]` to inspect the current permission level
-- `/ro`, `/ww`, or `/dfa` to quickly switch the active project's permission level
-- `/permissions ro|ww|dfa` or `/permissions <project> read-only|workspace-write|danger-full-access` to change a project's sandbox level
-- `/approve` or `/a [project|btw] [session]`, `/deny` or `/d [project|btw]`, and `/cancel` or `/q [project|btw]` to answer pending approval prompts
-- `/stop` or `/x [project|btw]` to cancel an in-flight Codex run
-- `/help` or `/h` to see command help
+Only explicitly allowed direct-chat senders can control the relay. Credentials under `plugins/whatsapp-relay/data/auth*` are private runtime data. Codex defaults to `workspace-write`; OpenCode and Claude Code retain their native permission systems. Selecting an existing session does not import a stronger permission grant from that conversation. Full Codex access still requires the existing explicit confirmation flow.
 
-Voice replies:
+The relay coordinates runs it starts, but cannot guarantee exclusive ownership against another desktop client. Finish a desktop turn before continuing the same native session through WhatsApp. Separate directories or worktrees are appropriate when simultaneous conversations should not edit the same files.
 
-- `/voice status` to inspect whether spoken replies are enabled for this chat
-- `/voice on` or `/voice on 2x` to enable local spoken replies
-- `/voice off` to go back to text-only replies
-- `reply in voice at 1x ...` or `reply in voice at 2x ...` for a one-off spoken answer without changing the chat default
-
-`danger-full-access` requires an explicit confirmation code sent back over WhatsApp before the bridge disables the sandbox for that project session. For the active project, the bridge now asks you to confirm with a short reply like `/dfa 123456`; for another project it uses `/dfa <project> 123456`.
-Voice notes are transcribed locally with `mlx-community/parakeet-tdt-0.6b-v3` through `uvx` and `ffmpeg`. The bridge echoes the transcript back before acting on it, and very short low-confidence transcriptions are rejected so you can retry instead of sending garbage to Codex.
-High-impact repo actions such as merges, releases, rebases, retargets, and deletes are intentionally not executed straight from voice; the bridge asks you to resend those as text so a misheard number does not mutate the wrong branch or PR.
-When voice replies are enabled with `/voice on` or a one-shot `reply in voice at 2x ...` prompt, the bridge also synthesizes a local outbound WhatsApp voice note.
-If a spoken reply contains something you need to click or copy, such as a preview URL, link, slash command, or confirmation code, the bridge now sends a short text companion with those actionable bits.
-
-Project switching is sticky per chat. One-shot `/in` prompts do not change the active project, and `/btw` always uses a fresh disposable thread.
-
-## Working Across Projects From WhatsApp
-
-The chat always has one current project. Normal text and voice prompts go there. On top of that, you can send one-off work to another project, jump between saved sessions inside a project, and answer approvals without losing your place.
-
-The practical model is:
-
-- Use `/project <alias>` when you want to move your default lane to another project.
-- Use `/project` or `/projects` to see numbered shortcuts, then `/project 2` to jump quickly without typing the alias.
-- Use `/project <natural hint>` when you want Codex to choose among the projects that already exist, for example `/project blood project`.
-- Use `/in <alias> <prompt>` when you want to send one prompt somewhere else without switching away.
-- Use `/btw <prompt>` for disposable side questions that should not touch any project session.
-- Use `/ls [project]` and `/session [project] <number>` when you want to switch this chat to another saved Codex thread inside the same project.
-
-Quick mnemonic:
-
-```text
-/project  -> move my main lane
-/in       -> send one thing elsewhere
-/session  -> switch threads inside one project
-/btw      -> ask a side question and come right back
-```
-
-Examples:
-
-- Start something long in `project-b`, then switch to `project-a`:
-  - `/project project-b`
-  - `run the full test suite and tell me what is failing`
-  - `/project project-a`
-  - `keep working on the login bug`
-- Send one-off work to `project-b` while staying focused on `project-a`:
-  - `/project project-a`
-  - `/in project-b run pwd and tell me which branch you are on`
-- Ask a side question without disturbing either project:
-  - `/btw what changed in GPT-5.4 reasoning modes?`
-
-## Session Switching Inside One Project
-
-Each project keeps its own session history. That means you can return to an older thread for the same project without affecting other projects.
-
-Examples:
-
-- List recent sessions for the current project:
-  - `/ls`
-- List recent sessions for another project:
-  - `/ls alpha-app`
-- Switch the current project to the second listed session:
-  - `/session 2`
-- Switch another project directly:
-  - `/session alpha-app 2`
-- Connect by thread id prefix:
-  - `/session alpha-app 019d36f3`
-
-The bridge keeps one active session pointer per project in each chat. You can switch that pointer whenever you want.
-
-Important limitation: the bridge only allows one in-flight Codex run per project alias at a time. If you want true parallel work on the same repo family, use separate worktrees as separate projects and switch between those project aliases from WhatsApp.
-
-```text
-repo root
-  |
-  +-- worktree-a  -> project-a
-  +-- worktree-b  -> project-b
-  +-- worktree-c  -> project-c
-
-One repo family, several WhatsApp-manageable projects
-```
-
-## Background Completions, Approvals, and Permissions
-
-If `project-b` finishes while you are working in `project-a`, the bridge posts the completion back into the chat and tells you that you are still in `project-a`. It does not switch you automatically.
-
-The same applies to approvals and failures:
-
-- approvals can be answered without switching projects, for example `/a project-b` or `/d project-b`
-- failures call out which project failed and remind you which project is still active
-- permission changes can be done quickly with `/ro`, `/ww`, or `/dfa` for the active project, or explicitly with `/p project-b ww`
-
-That makes the WhatsApp flow predictable: `/project` changes your main lane, `/in` sends one prompt to another lane, `/session` changes which saved thread a project points at, and background events never steal focus.
-
-## Voice-Mode Project Control
-
-Voice notes can now drive the same project controls through a Codex intent-classification step. That means the bridge does not depend on a hardcoded phrase table for project and session juggling. Instead, the transcribed note is classified as either a bridge command or a normal prompt before the bridge acts on it, using a lightweight dedicated Codex model rather than your main work session settings.
-
-Examples of intents the classifier should understand:
-
-- `projects`
-- `project alpha app`
-- `list sessions for alpha app`
-- `session alpha app 2`
-- `status for alpha app`
-- `start new session in alpha app`
-- `workspace write`
-- `read only`
-- `danger full access`
-
-Practical rule: if you want to juggle projects by voice, make the intent explicit. Say `project ...`, `sessions ...`, `session ...`, `status ...`, or `start new session in ...` so Codex can cleanly map the transcript into a bridge action.
-
-Voice-mode mental model:
-
-```text
-voice note
-   |
-   +--> local transcription
-   |
-   +--> intent classification
-          |
-          +--> bridge command
-          |      project / session / permissions / status
-          |
-          +--> normal prompt
-                 send it to the current project session
-```
-
-## What It Does
-
-- links WhatsApp with a QR shown in Codex output
-- lets Codex inspect recent chats and messages
-- lets Codex send WhatsApp messages
-- can sync older history on demand
-- can expose Codex through WhatsApp for allowed phone numbers
-- can switch a phone chat between existing Codex threads
-- can keep multiple project runs active at the same time from one chat
-- can switch the active project per chat and auto-discover repos from local directory hints
-- can send one-off prompts to another project without switching the main thread
-- can handle disposable `/btw` questions outside the main project thread
-- can run each phone chat at `read-only`, `workspace-write`, or `danger-full-access`
-- can transcribe WhatsApp voice notes locally and feed them into the active Codex session
-- can synthesize local WhatsApp voice-note replies with either macOS `say` or `ResembleAI/chatterbox-turbo`
-
-## Safety Notes
-
-- `workspace-write` is the default bridge permission level. It keeps the chat inside the workspace and relays approval prompts back to WhatsApp before guarded actions run.
-- `danger-full-access` is per-chat and requires a short confirmation code reply such as `/dfa 123456`. Use `/new` or `/permissions workspace-write` to drop back down.
-- Only one controller bridge should own the live WhatsApp session at a time. Starting a second checkout now refuses instead of silently replacing the current bridge.
-- Auth material under `plugins/whatsapp-relay/data/auth*` is local runtime state and should never be committed.
-- Typed slash commands remain the most reliable way to change sessions or permissions. Voice notes work best for natural prompts and short spoken commands like `help`, `status`, `stop`, and `new session`.
+Portable Windows voice dictation remains deferred. The following voice instructions describe the inherited platform-specific implementation, not verified Windows support.
 
 ## Voice Notes
 
