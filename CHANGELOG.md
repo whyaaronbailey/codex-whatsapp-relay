@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-13
+
 ### Fixed
 
 - Native session lists and connection errors identify their host, coding engine and workspace, making project-specific discovery explicit.
