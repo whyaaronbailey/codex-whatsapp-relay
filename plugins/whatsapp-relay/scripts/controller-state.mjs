@@ -108,7 +108,8 @@ export function defaultProjectSession() {
     lastThreadChoicesAt: null,
     lastErrorAt: null,
     lastError: null,
-    queuedPrompts: []
+    queuedPrompts: [],
+    queuedPromptsPaused: false
   };
 }
 

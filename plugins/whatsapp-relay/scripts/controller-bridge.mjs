@@ -251,6 +251,7 @@ export function applyRunLifecycleEvent(activeRun, event, timestamp = new Date().
 
   switch (event.type) {
     case "turnStarted":
+      activeRun.turnStarted = true;
       activeRun.status = "running";
       activeRun.threadId = activeRun.threadId ?? event.threadId ?? null;
       return activeRun;
@@ -1616,7 +1617,7 @@ export class WhatsAppControllerBridge {
     await this.upsertProjectSession(phoneKey, projectAlias, {
       chatPatch,
       threadName,
-      projectPatch: defaultProjectSession()
+      projectPatch: { ...defaultProjectSession(), queuedPromptsPaused: false }
     });
   }
 
@@ -1706,6 +1707,7 @@ export class WhatsAppControllerBridge {
     threadName = this.getProjectSession(phoneKey, alias, threadName).threadName;
     return this.stateStore.mutateSession(phoneKey, (session) => {
       const bucket = scopeType === "btw" ? session.btw : projectThreadSession(session.projects[alias], threadName);
+      if (bucket?.queuedPromptsPaused) return null;
       return bucket?.queuedPrompts.shift() ?? null;
     });
   }
@@ -1716,7 +1718,7 @@ export class WhatsAppControllerBridge {
     return this.stateStore.mutateSession(phoneKey, (session) => {
       const bucket = scopeType === "btw" ? session.btw : projectThreadSession(session.projects[alias], threadName);
       const count = bucket?.queuedPrompts.length ?? 0;
-      if (bucket) bucket.queuedPrompts = [];
+      if (bucket) { bucket.queuedPrompts = []; bucket.queuedPromptsPaused = false; }
       return count;
     });
   }
@@ -1775,11 +1777,14 @@ export class WhatsAppControllerBridge {
       await this.sendReply(remoteJid, "The project destination changed before the message could be queued. Select the intended project and resend it.");
       return true;
     }
+    const queueHeld = scopeType === "project" && this.getProjectSession(phoneKey, project.alias, threadName).session.queuedPromptsPaused;
     await this.sendReply(
       remoteJid,
       joinMessageSections(
         statusPrelude,
-        scopeType === "btw"
+        queueHeld
+          ? `Saved your follow-up, but automatic queue delivery is held for ${project.alias}/${threadName}. Use /stop ${project.alias}/${threadName} to clear held messages, then resend the messages you want.`
+          : scopeType === "btw"
           ? "Queued your next btw message. I will read it as soon as the current task finishes."
           : `Queued your next message for project ${project.alias}/${threadName}. I will read it as soon as the current task finishes.`,
         activeRun?.pendingApproval
@@ -3221,6 +3226,7 @@ export class WhatsAppControllerBridge {
         projectAlias: project.alias,
         threadName
       })}`,
+      projectSession.queuedPromptsPaused && projectSession.queuedPrompts?.length ? "queued_messages_held: yes (not submitted; /stop clears them)" : null,
       `permissions: ${permissionLevel}`,
       `voice_reply: ${formatVoiceReplySummary(voiceReply)}`,
       `voice_reply_provider: ${resolveConfiguredTtsProvider(config)}`,
@@ -3826,11 +3832,16 @@ export class WhatsAppControllerBridge {
         : projectRunKey(phoneKey, project.alias, threadName);
     const active = this.activeRuns.get(runKey);
     if (!active) {
+      const clearedQueued = await this.clearQueuedPrompts(phoneKey, {
+        scopeType: target.targetType === "btw" ? "btw" : "project", projectAlias: project.alias, threadName
+      });
       await this.sendReply(
         remoteJid,
-        target.targetType === "btw"
-          ? "No Codex run is active for btw."
-          : `No Codex run is active for project ${project.alias}/${threadName}.`
+        [target.targetType === "btw"
+          ? "No relay turn is active for btw."
+          : `No relay turn is active for ${project.alias}/${threadName}. The conversation is preserved.`,
+        clearedQueued ? `Cleared ${clearedQueued} queued follow-up message${clearedQueued === 1 ? "" : "s"}.` : null
+        ].filter(Boolean).join("\n")
       );
       return;
     }
@@ -4123,6 +4134,7 @@ export class WhatsAppControllerBridge {
             lastPromptAt: new Date().toISOString(),
             lastPromptText: prompt,
             lastPromptVoiceReply: activeVoiceReply.enabled ? activeVoiceReply : null,
+            queuedPromptsPaused: Boolean(projectSession.queuedPromptsPaused && projectSession.queuedPrompts?.length),
             threadId: existingThreadId
           }
         });
@@ -4141,13 +4153,14 @@ export class WhatsAppControllerBridge {
         remoteJid,
         joinMessageSections(
           statusPrelude,
-          scopeType === "btw"
-            ? "Starting a disposable btw session. I will answer here and then return to your current project."
-            : scopeLabel !== activeScopeAtDispatch
-              ? `Started a one-off run in ${scopeLabel}. You are still in ${activeScopeAtDispatch}. I will post the result here when it completes.`
-              : existingThreadId
-                ? `Working in ${scopeLabel} session ${shortThreadId(existingThreadId)} with ${permissionLevel} permissions. I will post the result here when it completes.`
-                : `Starting a fresh session in ${scopeLabel} with ${permissionLevel} permissions. I will post the result here when it completes.`
+          [
+            (project.engine ?? "codex") === "codex" && activeRun.turnStarted ? "The coding tool accepted your message. Waiting for its reply." : "Connecting to the coding tool. Waiting for it to accept your message.",
+            `Computer: ${project.host ?? "host"} | tool: ${project.engine ?? "codex"}`,
+            `Session: ${existingThreadId ? `${projectSession.connectedThreadName ? `${projectSession.connectedThreadName} — ` : ""}${existingThreadId}` : "new"}`,
+            `Directory: ${project.workspace}`,
+            `Relay slot: ${scopeType === "btw" ? "btw" : `${project.alias}/${threadName}`} | permissions: ${permissionLevel}`,
+            scopeLabel !== activeScopeAtDispatch ? `Your selected session is unchanged (${activeScopeAtDispatch}).` : null
+          ].filter(Boolean).join("\n")
         )
       );
 
@@ -4262,6 +4275,10 @@ export class WhatsAppControllerBridge {
         return;
       }
 
+      const ownershipRejected = error?.code === "ERR_CODEX_THREAD_OWNED" &&
+        error.stage === "thread/resume" && error.promptSubmitted === false && !activeRun.turnStarted;
+      if (ownershipRejected) activeRun.suppressQueueDrain = true;
+
       if (scopeType === "project") {
         const recorded = await this.upsertProjectSession(phoneKey, project.alias, {
           threadName,
@@ -4274,10 +4291,25 @@ export class WhatsAppControllerBridge {
           projectPatch: {
             pendingApproval: null,
             lastErrorAt: new Date().toISOString(),
-            lastError: error.message
+            lastError: error.message,
+            ...(ownershipRejected ? { queuedPromptsPaused: true } : {})
           }
         });
         if (!recorded) return;
+      }
+
+      if (ownershipRejected) {
+        const held = this.queuedPromptCount(phoneKey, { projectAlias: project.alias, threadName });
+        await this.sendReply(remoteJid, [
+          "Your message was not submitted. The original conversation has been preserved; no replacement was created.",
+          `Computer: ${project.host ?? "host"} | tool: codex`,
+          `Session: ${projectSession.connectedThreadName ? `${projectSession.connectedThreadName} — ` : ""}${existingThreadId}`,
+          `Directory: ${project.workspace}`,
+          "Another Codex client, such as the desktop app, owns this conversation. It can keep ownership while idle; this does not mean a response is being generated.",
+          "To use it from WhatsApp, fully quit the owning client when safe, then resend your message after it releases the conversation. Switching tabs or finishing a turn may not release it.",
+          held ? `${held} queued message(s) are held and were not submitted. Use /stop ${project.alias}/${threadName} to clear them, then resend the messages you want.` : null
+        ].filter(Boolean).join("\n\n"));
+        return;
       }
 
       await this.sendReply(
@@ -4310,7 +4342,7 @@ export class WhatsAppControllerBridge {
       // A stopped run may finish after a replacement starts. Never delete it.
       const owned = ownsRun();
       if (owned && (!activeRun.stopping || (activeRun.stopUnconfirmed && activeRun.nativeOutcomeConfirmed))) this.activeRuns.delete(runKey);
-      if (owned && !activeRun.cancelled && destinationUnchanged()) {
+      if (owned && !activeRun.cancelled && !activeRun.suppressQueueDrain && destinationUnchanged()) {
         await this.runNextQueuedPrompt({ phoneKey, remoteJid, label, scopeType, projectAlias: project.alias, threadName });
       }
     }

@@ -432,6 +432,18 @@ function formatRequestError(message = "Unknown app-server error.") {
   return new Error(message);
 }
 
+function classifyThreadResumeError(error, threadId) {
+  // This rejection happens before turn/start. "Active writer" refers to the
+  // loaded client owning the thread, not necessarily an active generation.
+  if (!/already has an active writer/i.test(String(error?.message ?? ""))) return error;
+  const ownershipError = new Error("Another Codex client owns this conversation, even if that client is idle.", { cause: error });
+  Object.assign(ownershipError, {
+    code: "ERR_CODEX_THREAD_OWNED", threadId, stage: "thread/resume",
+    promptSubmitted: false, retryable: false
+  });
+  return ownershipError;
+}
+
 function formatTurnError(turnError) {
   if (!turnError) {
     return new Error("Codex turn failed.");
@@ -1224,7 +1236,7 @@ export function startCodexTurn({
           ...(model ? { model } : {}),
           approvalPolicy: permissionParams.approvalPolicy,
           persistExtendedHistory: false
-        })
+        }).catch((error) => { throw classifyThreadResumeError(error, threadId); })
       : await client.request("thread/start", {
           cwd: workspace,
           ...(model ? { model } : {}),

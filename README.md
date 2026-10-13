@@ -125,7 +125,9 @@ Uploads are stored under `<directory>/.whatsapp-relay/inbox`; returned files are
 
 Only explicitly allowed direct-chat senders can control the relay. Credentials under `plugins/whatsapp-relay/data/auth*` are private runtime data. Codex defaults to `workspace-write`; OpenCode and Claude Code retain their native permission systems. Selecting an existing session does not import a stronger permission grant from that conversation. Full Codex access still requires the existing explicit confirmation flow.
 
-The relay coordinates runs it starts, but cannot guarantee exclusive ownership against another desktop client. Finish a desktop turn before continuing the same native session through WhatsApp. Separate directories or worktrees are appropriate when simultaneous conversations should not edit the same files.
+The Codex adapter starts a separate native app-server for each relay run. A conversation still loaded by the Codex desktop app or another client can reject resumption with `already has an active writer`, even after its current turn finishes. Session listing and selection do not establish write access. Simultaneous control of a desktop-owned Codex conversation is not supported by this adapter.
+
+If this happens, the relay preserves the original conversation, leaves your selection unchanged and reports that the message was not submitted. To continue that same conversation, let desktop work finish, then fully quit the owning Codex client on that computer before resending your message. Merely switching conversations or waiting for a turn to finish may not release ownership. Alternatively, `/new <prompt>` deliberately starts a separate conversation in the selected directory, without the old conversation's history. The relay never removes native locks, closes another client or silently forks your conversation. Separate directories or worktrees are appropriate when simultaneous conversations should not edit the same files.
 
 Portable Windows voice dictation remains deferred. The following voice instructions describe the inherited platform-specific implementation, not verified Windows support.
 

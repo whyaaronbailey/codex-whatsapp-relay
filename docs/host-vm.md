@@ -119,7 +119,9 @@ Loopback addresses belong to the machine running Codex. A VM's `127.0.0.1` is no
 
 Run one gateway for the linked WhatsApp account. The per-user owner lock prevents a second local checkout from claiming the controller on that machine. Windows uses the actual user home for this lock even when `HOME` is absent. The lock does not coordinate different operating-system accounts or separate computers, and process liveness is checked by PID rather than a process identity token.
 
-Avoid submitting work to the same thread concurrently from the desktop app and WhatsApp. The relay maintains project sessions and its own queues, but does not guarantee exclusive ownership against another Codex client writing to that thread. Finish or interrupt the current desktop run before continuing it from WhatsApp.
+The Codex adapter launches its own native app-server rather than attaching to the desktop app's app-server. Native writer ownership can remain held for a loaded conversation even when the desktop reports it as idle. Listing or selecting a saved session does not prove it can be resumed. When `thread/resume` rejects with `already has an active writer`, the relay has not submitted a new turn. That assurance applies to this specific resume rejection, not to arbitrary connection or turn failures.
+
+For that error, the selected conversation and directory are preserved. Let work in the owning client finish, fully quit that client on the selected computer, and then resend your message to continue the same conversation. Switching tabs or finishing a turn alone may not release ownership. `/new <prompt>` is an explicit alternative that starts another conversation with separate history. Do not delete lock files, terminate another client's work, or copy transcripts to evade ownership. Simultaneous control of desktop-owned Codex conversations requires a supported connection to the same owning app-server; this relay does not yet provide that integration.
 
 Portable voice dictation and spoken replies are postponed. The upstream voice-note implementation remains present, with platform-specific dependencies; do not treat it as working Windows voice support. Text commands and document/image transfer are the initial supported workflow.
 
@@ -127,7 +129,7 @@ Before relying on unattended use, validate this sequence on the actual linked ac
 
 1. Select `pc-work`, start a session, and receive a text reply.
 2. Select `vm-work`, start a session, and verify the reply came from the VM workspace.
-3. List and continue an idle existing session on each machine.
+3. List and continue an existing session on each machine after its previous client releases ownership. Separately verify that a desktop-owned conversation produces a clear refusal without starting a turn, and that its selected ID and directory are preserved.
 4. Upload a small text file with a caption on each machine; verify the saved location and contents.
 5. Send an output file back from each machine and compare its hash/content.
 6. Confirm an unknown sender cannot control the bridge and an export outside the workspace fails.

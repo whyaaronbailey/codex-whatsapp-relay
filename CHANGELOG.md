@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex writer-ownership refusals now explain that the message was not submitted and preserve the selected conversation. A desktop client can retain ownership while idle; ending its current turn alone does not ensure the relay can resume it.
+- Startup acknowledgments distinguish connecting from an accepted turn, and queued follow-ups are held after an ownership refusal instead of being replayed automatically.
+- Documentation now states that simultaneous control of a desktop-owned Codex conversation is unsupported by the current separate-app-server adapter. This release improves refusal handling; it does not add a shared desktop connection.
+
 ## [0.7.0] - 2026-10-13
 
 ### Changed
