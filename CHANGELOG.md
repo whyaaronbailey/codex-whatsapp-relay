@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Native session lists and connection errors identify their host, coding engine and workspace, making project-specific discovery explicit.
+- Targeted session selection guidance keeps the project and named thread explicit so subsequent messages reach the intended conversation.
+
 ## [0.6.0] - 2026-10-13
 
 ### Added

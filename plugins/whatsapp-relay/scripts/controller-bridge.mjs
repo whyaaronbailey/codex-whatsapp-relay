@@ -75,6 +75,16 @@ function invalidControllerCommandError(message) {
   return error;
 }
 
+function nativeSessionScopeLines(project, threadName) {
+  return [
+    `Host: ${project.host ?? "host"} | engine: ${project.engine ?? "codex"} | relay slot: ${project.alias}/${threadName}`,
+    `Workspace: ${project.workspace}`
+  ];
+}
+
+const NATIVE_SESSION_SCOPE_HINT =
+  "Only native sessions in this workspace are searched. For another folder, use /projects and select its configured alias with /project <alias>.";
+
 const COMMAND_ALIASES = new Map([
   ["help", "help"],
   ["h", "help"],
@@ -1031,10 +1041,10 @@ function summarizeThread(thread, currentThreadId) {
   return summarizeThreadChoice(thread, currentThreadId);
 }
 
-function summarizeThreadChoice(thread, currentThreadId, index = null) {
+function summarizeThreadChoice(thread, currentThreadId, index = null, target = null) {
   const preview = sanitizeThreadPreview(thread.preview);
   const shortcut = Number.isInteger(index)
-    ? ` ${formatThreadShortcut(index)}`
+    ? ` ${target ? `/session ${target} ${index}` : formatThreadShortcut(index)}`
     : "";
   return [
     `${Number.isInteger(index) ? `${index}.` : "-"} ${shortThreadId(thread.id)}${
@@ -1482,6 +1492,11 @@ export class WhatsAppControllerBridge {
   sessionScopeLabel(phoneKey, project = this.getActiveProject(phoneKey), threadName = null) {
     const selected = this.getProjectSession(phoneKey, project.alias, threadName).threadName;
     return `${project.host ?? "host"}/${project.engine ?? "codex"}/${project.alias}/${selected}`;
+  }
+
+  isActiveProjectSession(phoneKey, projectAlias, threadName) {
+    const active = this.getProjectSession(phoneKey);
+    return active.project.alias === projectAlias && active.threadName === threadName;
   }
 
   nativeThreadBusy(project, nativeThreadId, exceptKey = null) {
@@ -2982,15 +2997,16 @@ export class WhatsAppControllerBridge {
       target.projectAlias ?? this.getActiveProject(phoneKey).alias
     );
     const { session, threadName } = this.getProjectSession(phoneKey, project.alias, target.threadName);
-    const threads = await this.runner.listCodexThreads({
-      ...this.runnerOptions(project),
-      host: resolveHost(config, project.host ?? "host"),
-      workspace: project.workspace,
-      limit: SESSION_LIST_LIMIT
-    });
+    const threads = await this.listProjectNativeThreads(remoteJid, project, threadName, SESSION_LIST_LIMIT);
+    if (!threads) return;
 
     if (!threads.length) {
-      await this.sendReply(remoteJid, "No native sessions were found.");
+      await this.sendReply(remoteJid, [
+        "No native sessions were found in this workspace.",
+        ...nativeSessionScopeLines(project, threadName),
+        "",
+        NATIVE_SESSION_SCOPE_HINT
+      ].join("\n"));
       return;
     }
 
@@ -3007,17 +3023,46 @@ export class WhatsAppControllerBridge {
       }
     });
 
+    const isActive = this.isActiveProjectSession(phoneKey, project.alias, threadName);
+    const sessionTarget = `${project.alias}/${threadName}`;
     const lines = [
-      `Recent ${project.engine ?? "codex"} sessions for ${project.alias}/${threadName} on ${project.host ?? "host"}:`,
+      "Recent native sessions:",
+      ...nativeSessionScopeLines(project, threadName),
       "",
       ...threads.map((thread, index) =>
-        summarizeThreadChoice(thread, session.threadId ?? null, index + 1)
+        summarizeThreadChoice(thread, session.threadId ?? null, index + 1, isActive ? null : sessionTarget)
       ),
       "",
-      "Use /1, /2, ..., /session <number>, or /connect <thread-id-prefix> to switch this chat.",
-      `You can also jump directly with /session ${project.alias} <number>.`
+      ...(isActive ? [
+        "Use /1, /2, ..., /session <number>, or /connect <thread-id-prefix> to switch this chat.",
+        `You can also jump directly with /session ${sessionTarget} <number>.`
+      ] : [
+        `Use /session ${sessionTarget} <number> or /session ${sessionTarget} <thread-id-prefix> to attach to this slot.`,
+        "Your active relay slot is unchanged."
+      ]),
+      "",
+      NATIVE_SESSION_SCOPE_HINT
     ];
     await this.sendReply(remoteJid, lines.join("\n"));
+  }
+
+  async listProjectNativeThreads(remoteJid, project, threadName, limit) {
+    try {
+      return await this.runner.listCodexThreads({
+        ...this.runnerOptions(project),
+        workspace: project.workspace,
+        limit
+      });
+    } catch (error) {
+      await this.sendReply(remoteJid, [
+        "Could not list native sessions.",
+        ...nativeSessionScopeLines(project, threadName),
+        `Error: ${error?.message ?? String(error)}`,
+        "",
+        NATIVE_SESSION_SCOPE_HINT
+      ].join("\n"));
+      return null;
+    }
   }
 
   async connectToThread({ phoneKey, remoteJid, payload, label }) {
@@ -3062,12 +3107,8 @@ export class WhatsAppControllerBridge {
       return;
     }
 
-    const threads = await this.runner.listCodexThreads({
-      ...this.runnerOptions(project),
-      host: resolveHost(config, project.host ?? "host"),
-      workspace: project.workspace,
-      limit: SESSION_CONNECT_SEARCH_LIMIT
-    });
+    const threads = await this.listProjectNativeThreads(remoteJid, project, threadName, SESSION_CONNECT_SEARCH_LIMIT);
+    if (!threads) return;
     const { session } = this.getProjectSession(phoneKey, project.alias, threadName);
     const resolution = resolveThreadSelection(threads, token, session);
 
@@ -3132,16 +3173,23 @@ export class WhatsAppControllerBridge {
       return;
     }
 
+    const isActive = this.isActiveProjectSession(phoneKey, project.alias, threadName);
+    const sessionTarget = `${project.alias}/${threadName}`;
     await this.sendReply(
       remoteJid,
       [
-        `Switched ${project.alias}/${threadName} to session ${shortThreadId(resolution.match.id)}.`,
+        isActive
+          ? `Switched ${sessionTarget} to session ${shortThreadId(resolution.match.id)}.`
+          : `Attached session ${shortThreadId(resolution.match.id)} to ${sessionTarget}. Your active relay slot is unchanged.`,
         resolution.match.name ? `name: ${resolution.match.name}` : null,
         sanitizeThreadPreview(resolution.match.preview)
           ? `preview: ${sanitizeThreadPreview(resolution.match.preview)}`
           : null,
         "",
-        "Next: send a normal message to continue in that session."
+        ...(isActive ? ["Next: send a normal message to continue in that session."] : [
+          `Next: use /in ${sessionTarget} <prompt> to continue there.`,
+          `To select it for normal messages, send /project ${project.alias}, then /thread ${threadName}.`
+        ])
       ]
         .filter(Boolean)
         .join("\n")
