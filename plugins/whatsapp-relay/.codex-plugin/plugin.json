@@ -1,6 +1,6 @@
 {
   "name": "whatsapp-relay",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Control Codex, OpenCode and Claude Code on a PC and VM from WhatsApp, with named sessions and file transfers.",
   "install_url": "https://raw.githubusercontent.com/whyaaronbailey/codex-whatsapp-relay/refs/heads/main/plugins/whatsapp-relay/.codex-plugin/plugin.json",
   "author": {

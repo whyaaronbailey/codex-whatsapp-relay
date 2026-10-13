@@ -1,6 +1,6 @@
 {
   "name": "codex-whatsapp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "WhatsApp control of Codex, OpenCode and Claude Code on a PC and VM, with named sessions and file transfers.",

@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-13
+
 ### Added
 
 - Named parallel relay threads within one project, independent selection and queues, and explicit project/thread targeting for work and control.
