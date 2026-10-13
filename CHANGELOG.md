@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-13
+
 ### Fixed
 
 - Codex writer-ownership refusals now explain that the message was not submitted and preserve the selected conversation. A desktop client can retain ownership while idle; ending its current turn alone does not ensure the relay can resume it.
