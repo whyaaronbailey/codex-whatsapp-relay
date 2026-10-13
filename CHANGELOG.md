@@ -18,6 +18,10 @@ All notable changes to this project will be documented in this file.
 - Non-Codex engines use their native permission systems. Codex sandbox settings are never silently presented as equivalent protections.
 - Legacy conversations remain the main named thread; `/threads` lists named relay threads and `/sessions` lists saved native sessions.
 
+### Fixed
+
+- Atomic controller-state saves briefly retry Windows file locks, preserve the previous state on failure, and clean up their own temporary files.
+
 Portable voice support remains deferred. Real WhatsApp pairing and installed engine/version checks are required for each deployment.
 
 ## [0.5.0] - 2026-10-13

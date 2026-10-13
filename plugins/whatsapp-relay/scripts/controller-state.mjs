@@ -1,11 +1,29 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { normalizeProjectAlias } from "./controller-projects.mjs";
 import { controllerStateFile } from "./paths.mjs";
 
 const DEFAULT_PROJECT_ALIAS = "main";
 export const DEFAULT_THREAD_NAME = "main";
+
+async function replaceStateFile(tempFile, filePath) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fs.rename(tempFile, filePath);
+      return;
+    } catch (error) {
+      // Windows readers and virus scanners can briefly lock the destination.
+      // Keep the previous file intact and retry only the atomic replacement.
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error?.code) || attempt >= 5) {
+        throw error;
+      }
+      await delay(25 * (attempt + 1));
+    }
+  }
+}
 
 export function normalizeThreadName(value) {
   const name = String(value ?? DEFAULT_THREAD_NAME).trim().toLowerCase();
@@ -256,10 +274,19 @@ export class ControllerStateStore {
     this.data = normalizeState(this.data);
     const tempFile = path.join(
       path.dirname(this.filePath),
-      `.${path.basename(this.filePath)}.${process.pid}.${Date.now()}.tmp`
+      `.${path.basename(this.filePath)}.${process.pid}.${randomUUID()}.tmp`
     );
-    await fs.writeFile(tempFile, JSON.stringify(this.data, null, 2));
-    await fs.rename(tempFile, this.filePath);
+    const serialized = JSON.stringify(this.data, null, 2);
+    let tempCreated = false;
+    try {
+      const handle = await fs.open(tempFile, "wx");
+      tempCreated = true;
+      try { await handle.writeFile(serialized); }
+      finally { await handle.close(); }
+      await replaceStateFile(tempFile, this.filePath);
+    } finally {
+      if (tempCreated) await fs.rm(tempFile, { force: true }).catch(() => {});
+    }
     return this.data;
   }
 
