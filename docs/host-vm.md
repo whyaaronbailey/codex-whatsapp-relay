@@ -4,6 +4,8 @@ The main PC runs one WhatsApp controller. Choose a computer with `/host`, browse
 
 For OpenCode/OpenChamber, Claude Code, or several simultaneous conversations in one directory, see [named sessions and coding tools](multiple-agents.md). The machine and file setup below applies to all three engines.
 
+For an existing desktop-owned Codex conversation, this preview offers an opt-in [shared gateway adapter](shared-codex-gateway.md). The standard setup described below uses separate app-servers; it does not enable that experimental integration.
+
 ```text
 WhatsApp phone
       |
@@ -121,7 +123,7 @@ Run one gateway for the linked WhatsApp account. The per-user owner lock prevent
 
 The Codex adapter launches its own native app-server rather than attaching to the desktop app's app-server. Native writer ownership can remain held for a loaded conversation even when the desktop reports it as idle. Listing or selecting a saved session does not prove it can be resumed. When `thread/resume` rejects with `already has an active writer`, the relay has not submitted a new turn. That assurance applies to this specific resume rejection, not to arbitrary connection or turn failures.
 
-For that error, the selected conversation and directory are preserved. Let work in the owning client finish, fully quit that client on the selected computer, and then resend your message to continue the same conversation. Switching tabs or finishing a turn alone may not release ownership. `/new <prompt>` is an explicit alternative that starts another conversation with separate history. Do not delete lock files, terminate another client's work, or copy transcripts to evade ownership. Simultaneous control of desktop-owned Codex conversations requires a supported connection to the same owning app-server; this relay does not yet provide that integration.
+For that error, the selected conversation and directory are preserved. Let work in the owning client finish, fully quit that client on the selected computer, and then resend your message to continue the same conversation. Switching tabs or finishing a turn alone may not release ownership. `/new <prompt>` is an explicit alternative that starts another conversation with separate history. Do not delete lock files, terminate another client's work, or copy transcripts to evade ownership. To keep the desktop open during ordinary use, see the opt-in [shared gateway adapter](shared-codex-gateway.md); it requires a verified connection to the same owning backend and is not enabled by this setup.
 
 Portable voice dictation and spoken replies are postponed. The upstream voice-note implementation remains present, with platform-specific dependencies; do not treat it as working Windows voice support. Text commands and document/image transfer are the initial supported workflow.
 

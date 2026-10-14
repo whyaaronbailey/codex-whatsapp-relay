@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-14
+
+### Added
+
+- Opt-in experimental shared Codex gateway adapter for an independently installed, verified desktop backend on the PC or VM. Existing sessions preserve native settings; new sessions require explicit enablement. The standard separate-app-server mode remains the default.
+- Durable WhatsApp request identities and frozen destinations protect prompts and queued file captions from duplicate submission after reconnects or restarts. Unknown outcomes hold follow-ups for inspection.
+- `/status refresh` recovers saved gateway responses without resubmitting messages and reconnects newly created sessions only when their original relay slot is unchanged.
+- Graceful observer disconnects release gateway request locks while leaving desktop work running. Approvals and stopping native shared sessions remain desktop actions.
+- Portable Python adapter tests and CI coverage, plus optional integration tests against an installed gateway core. Shared desktop activation and a live WhatsApp round trip still require per-machine verification.
+
 ## [0.7.1] - 2026-10-13
 
 ### Fixed

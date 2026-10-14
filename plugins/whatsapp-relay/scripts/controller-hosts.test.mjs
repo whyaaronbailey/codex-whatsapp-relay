@@ -99,6 +99,27 @@ test("one-shot SSH operation times out and terminates its connection", async () 
   assert.equal(child.killed, true);
 });
 
+test("SSH request reconciliation forwards only a read-only status operation", async () => {
+  const request = { operation: "agent.gatewayStatus", engine: "codex", requestId: "wa-request-001", codexGateway: { pythonBin: "python", configPath: "/relay/gateway.json" } };
+  let received;
+  const status = await requestHostOperation(remote, request, {
+    spawnImpl() {
+      const child = fakeChild();
+      child.stdin.on("data", chunk => { received = JSON.parse(chunk); });
+      setImmediate(() => { child.stdout.write(JSON.stringify({ result: { completed: false, readOnly: true } })); child.emit("close", 0, null); });
+      return child;
+    }
+  });
+  assert.deepEqual(received, request);
+  assert.deepEqual(status, { completed: false, readOnly: true });
+});
+
+test("SSH status timeout leaves bounded receipt collection to release its lock", async () => {
+  const child = fakeChild();
+  await assert.rejects(requestHostOperation(remote, { operation: "agent.gatewayStatus", requestId: "wa-request-001" }, { timeoutMs: 10, spawnImpl: () => child }), /timed out/);
+  assert.equal(child.killed, false);
+});
+
 test("an offline SSH destination remains retryable", async () => {
   await assert.rejects(requestHostOperation(remote, { operation: "file.readOutgoing", workspace: "/repo", relativePath: "report.pdf" }, {
     spawnImpl() {

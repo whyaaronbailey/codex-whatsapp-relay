@@ -5,13 +5,18 @@ import { serializableAgentOptions } from "./agent-runner.mjs";
 
 function errorFromWire(value) {
   const error = new Error(value?.message ?? String(value ?? "Remote coding tool failed."));
-  if (value?.code) error.code = value.code;
-  if (value?.retryable !== undefined) error.retryable = value.retryable;
+  for (const key of ["code", "retryable", "promptSubmitted", "deliveryUncertain", "stage", "requestId"]) {
+    if (value?.[key] !== undefined) error[key] = value[key];
+  }
   return error;
 }
 
 export function wireError(error) {
-  return { message: String(error?.message ?? error), ...(error?.code ? { code: error.code } : {}), ...(typeof error?.retryable === "boolean" ? { retryable: error.retryable } : {}) };
+  const value = { message: String(error?.message ?? error) };
+  for (const key of ["code", "retryable", "promptSubmitted", "deliveryUncertain", "stage", "requestId"]) {
+    if (error?.[key] !== undefined) value[key] = error[key];
+  }
+  return value;
 }
 
 function writeLine(stream, value) {
@@ -39,14 +44,22 @@ export function startRemoteAgentTurn(options, { spawnImpl = spawn, idleTimeoutMs
   resultPromise.catch(() => {});
   const finish = (error) => {
     if (finished) return;
+    if (error && (options.codexGateway ?? options.host?.codexGateway) && error.promptSubmitted !== false) {
+      error.deliveryUncertain ??= true;
+      error.retryable = false;
+      error.requestId ??= options.requestId;
+      error.code ??= "ERR_CODEX_GATEWAY_UNCERTAIN";
+    }
     finished = true;
     clearTimeout(idleTimer);
     for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(error ?? new Error("The run has finished.")); }
     pending.clear();
     child.stdin.end();
     if (error) {
-      child.kill();
-      if (!childClosed) {
+      const sharedGateway = options.codexGateway ?? options.host?.codexGateway;
+      if (sharedGateway) child.unref?.();
+      else child.kill();
+      if (!childClosed && !sharedGateway) {
         killTimer = setTimeout(() => { if (!childClosed) child.kill("SIGKILL"); }, 2000);
         killTimer.unref?.();
       }
@@ -132,7 +145,7 @@ export function startRemoteAgentTurn(options, { spawnImpl = spawn, idleTimeoutMs
 
 export async function runAgentWorker(request, remainder, { input, output, startTurn, heartbeatMs = 10_000, controlTimeoutMs = 15_000 }) {
   const params = request?.params;
-  if (!params || !["opencode", "claude"].includes(params.engine) || typeof params.workspace !== "string" || typeof params.prompt !== "string") throw new Error("Invalid agent worker request.");
+  if (!params || !(["opencode", "claude"].includes(params.engine) || (params.engine === "codex" && params.codexGateway)) || typeof params.workspace !== "string" || typeof params.prompt !== "string") throw new Error("Invalid agent worker request.");
   let run;
   let done = false;
   const decoder = new StringDecoder("utf8");
@@ -155,12 +168,21 @@ export async function runAgentWorker(request, remainder, { input, output, startT
   const stop = () => stopPromise ??= (async () => {
     let timer;
     try {
+      if (params.engine === "codex" && params.codexGateway) {
+        // The desktop owns this run. Transport loss may detach our observer,
+        // but must never interrupt another client's work or kill its server.
+        run?.detach?.();
+        return;
+      }
       await Promise.race([
         Promise.resolve().then(() => run?.interrupt()),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Worker interruption timed out.")), 15_000); })
       ]);
     } catch { /* The native session may need attention after transport loss. */ }
-    finally { clearTimeout(timer); run?.child?.kill?.(); }
+    finally {
+      clearTimeout(timer);
+      if (!(params.engine === "codex" && params.codexGateway)) run?.child?.kill?.();
+    }
   })();
   const drain = () => {
     if (Buffer.byteLength(buffer) > MAX_WORKER_MESSAGE_BYTES) { void stop(); input.destroy(new Error("Agent control message too large.")); return; }
@@ -189,7 +211,7 @@ export async function runAgentWorker(request, remainder, { input, output, startT
   const onData = (chunk) => { buffer += decoder.write(chunk); drain(); };
   const onDisconnect = () => {
     if (!done) {
-      rejectDisconnect(new Error("Gateway disconnected; the worker is interrupting its owned run."));
+      rejectDisconnect(new Error(params.codexGateway ? "Gateway disconnected; the desktop session was left running." : "Gateway disconnected; the worker is interrupting its owned run."));
       void stop();
     }
   };

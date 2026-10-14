@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { spawnNativeCodex } from "./codex-process.mjs";
+import { normalizeCodexGateway } from "./codex-gateway-config.mjs";
 
 export const MAX_WORKER_MESSAGE_BYTES = 40 * 1024 * 1024;
 const HOST_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -8,7 +9,7 @@ const SSH_TARGET = /^[a-zA-Z0-9_][a-zA-Z0-9_.@:\[\]-]*$/;
 const NODE_COMMAND = /^[a-zA-Z0-9_./\\ :+-]+$/;
 const FILE_OPERATIONS = new Set(["file.writeIncoming", "file.readOutgoing", "file.list", "file.markSent"]);
 const CLASSIFICATION_OPERATIONS = new Set(["codex.classifyVoice", "codex.classifyProject"]);
-const AGENT_OPERATIONS = new Set(["agent.listThreads"]);
+const AGENT_OPERATIONS = new Set(["agent.listThreads", "agent.gatewayStatus"]);
 
 function normalizeHost(host) {
   if (!host || typeof host !== "object" || !HOST_ID.test(host.id ?? "")) {
@@ -27,6 +28,7 @@ function normalizeHost(host) {
   if (host.label) normalized.label = String(host.label);
   if (host.codexBin) normalized.codexBin = String(host.codexBin);
   if (host.claudeBin) normalized.claudeBin = String(host.claudeBin);
+  if (host.codexGateway != null) normalized.codexGateway = normalizeCodexGateway(host.codexGateway, platform);
   if (transport === "ssh") {
     if (!SSH_TARGET.test(host.target ?? "")) {
       throw new Error(`Host ${host.id} requires a configured SSH target (an alias or user@hostname).`);
@@ -115,9 +117,9 @@ export function spawnHostAppServer({ host = null, codexBin = "codex", workspace,
 
 export async function performHostOperation(request) {
   if (AGENT_OPERATIONS.has(request?.operation)) {
-    const { listAgentThreadsLocal } = await import("./agent-runner.mjs");
+    const { listAgentThreadsLocal, readGatewayRequestStatus } = await import("./agent-runner.mjs");
     const { operation, host: _ignored, ...params } = request;
-    return listAgentThreadsLocal(params);
+    return operation === "agent.gatewayStatus" ? readGatewayRequestStatus(params) : listAgentThreadsLocal(params);
   }
   if (FILE_OPERATIONS.has(request?.operation)) {
     const { performFileOperation } = await import("./relay-file-ops.mjs");
@@ -156,7 +158,10 @@ export async function requestHostOperation(host, request, { timeoutMs = 60_000, 
       else resolve(result);
     };
     const timer = setTimeout(() => {
-      child.kill();
+      // Status collection may hold the external gateway's durable request lock.
+      // Let its bounded read unwind rather than kill the worker mid-lock.
+      if (request.operation === "agent.gatewayStatus") child.unref?.();
+      else child.kill();
       finish(new Error(`Host ${resolved.id} operation timed out after ${timeoutMs}ms.`));
     }, timeoutMs);
     child.stdout.setEncoding("utf8");

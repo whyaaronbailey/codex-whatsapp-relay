@@ -73,6 +73,7 @@ function normalizeQueuedPrompt(value = {}) {
     projectAlias: typeof value.projectAlias === "string" ? value.projectAlias : null,
     threadName: normalizeThreadName(value.threadName) ?? DEFAULT_THREAD_NAME,
     bindingKey: typeof value.bindingKey === "string" ? value.bindingKey : null,
+    requestId: typeof value.requestId === "string" ? value.requestId : null,
     voiceReplyOverride:
       value.voiceReplyOverride?.enabled
         ? {
@@ -104,6 +105,7 @@ export function defaultProjectSession() {
     lastReplyVoiceReply: null,
     connectedThreadAt: null,
     connectedThreadName: null,
+    lastGatewayRequestId: null,
     lastThreadChoices: [],
     lastThreadChoicesAt: null,
     lastErrorAt: null,
@@ -122,6 +124,7 @@ export function defaultChatSession(phoneKey = null) {
     directoryFilter: null,
     browserRevision: 0,
     hostSessionBrowser: null,
+    gatewayRequests: {},
     voiceReply: null,
     projects: {
       [DEFAULT_PROJECT_ALIAS]: defaultProjectSession()
@@ -226,6 +229,10 @@ function normalizeChatSession(value = {}, phoneKey = null) {
     activeProject,
     voiceReply: value.voiceReply ?? null,
     projects,
+    gatewayRequests: value.gatewayRequests && typeof value.gatewayRequests === "object" && !Array.isArray(value.gatewayRequests)
+      ? Object.fromEntries(Object.entries(value.gatewayRequests).filter(([id, record]) =>
+          /^(?:wa-v1-[a-f0-9]{64}|relay-[a-f0-9-]{36})$/.test(id) && record?.requestId === id && record?.target))
+      : {},
     btw: {
       ...defaultChatSession().btw,
       ...(value.btw ?? {}),

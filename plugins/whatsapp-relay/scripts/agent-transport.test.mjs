@@ -194,6 +194,42 @@ test("Agent worker interrupts its owned run on gateway disconnect", async t => {
   assert.match(f.messages.at(-1).error.message, /Gateway disconnected/);
 });
 
+test("Shared Codex gateway SSH failures preserve delivery uncertainty without retries", async t => {
+  const child = fakeSsh(t);
+  const requestId = `wa-v1-${"a".repeat(64)}`;
+  const run = startRemoteAgentTurn({ ...options, engine: "codex", requestId, codexGateway: { pythonBin: "python", configPath: "/relay/gateway.json" } }, { spawnImpl: child.spawnImpl });
+  assert.equal(child.requests[0].params.requestId, requestId);
+  child.emit("close", 255);
+  await assert.rejects(run.resultPromise, error => error.deliveryUncertain === true && error.retryable === false && error.requestId === requestId);
+  assert.equal(child.requests.filter(r => r.operation === "agent.run").length, 1);
+});
+
+test("Shared Codex gateway preserves a verified refusal before submission", async t => {
+  const child = fakeSsh(t);
+  const run = startRemoteAgentTurn({ ...options, engine: "codex", codexGateway: { pythonBin: "python", configPath: "/relay/gateway.json" } }, { spawnImpl: child.spawnImpl });
+  child.send({ type: "error", error: { message: "Desktop ownership could not be verified", code: "BINDING_REFUSED", promptSubmitted: false, retryable: false } });
+  await assert.rejects(run.resultPromise, error => error.promptSubmitted === false && error.deliveryUncertain !== true && error.code === "BINDING_REFUSED");
+});
+
+test("Shared Codex SSH preserves confirmed delivery when only its reply is pending", async t => {
+  const child = fakeSsh(t);
+  const run = startRemoteAgentTurn({ ...options, engine: "codex", codexGateway: { pythonBin: "python", configPath: "/relay/gateway.json" } }, { spawnImpl: child.spawnImpl });
+  child.send({ type: "error", error: { message: "Waiting for desktop attention", code: "desktop_attention_required", promptSubmitted: true, deliveryUncertain: false, retryable: false } });
+  await assert.rejects(run.resultPromise, error => error.promptSubmitted === true && error.deliveryUncertain === false && error.code === "desktop_attention_required");
+});
+
+test("Shared Codex worker detaches on SSH loss and never interrupts the desktop", async t => {
+  const f = workerFixture(t);
+  let interrupts = 0, detaches = 0;
+  f.run.interrupt = async () => { interrupts++; };
+  f.run.detach = () => { detaches++; f.reject(new Error("Observer detached")); };
+  const worker = runAgentWorker({ params: { ...options, engine: "codex", codexGateway: { pythonBin: "python", configPath: "/relay/gateway.json" } } }, Buffer.alloc(0), { ...f, startTurn: () => f.run });
+  f.input.end(); await worker;
+  assert.equal(interrupts, 0);
+  assert.equal(detaches, 1);
+  assert.match(f.messages.at(-1).error.message, /desktop session was left running|Observer detached/);
+});
+
 test("Agent worker bounds a hung control call before finalizing its result", async t => {
   const f = workerFixture(t, { answerApproval: () => new Promise(() => {}) });
   const command = { id: 1, command: "approval", value: { requestId: "per_hanging", decision: "accept" } };

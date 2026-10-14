@@ -21,6 +21,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - run: python -B plugins/whatsapp-relay/scripts/test_codex_gateway_worker.py -v

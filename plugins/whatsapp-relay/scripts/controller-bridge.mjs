@@ -1,10 +1,11 @@
-import { randomInt, createHash } from "node:crypto";
+import { randomInt, randomUUID, createHash } from "node:crypto";
 import path from "node:path";
 
 import {
   classifyProjectIntent as classifyProjectIntentWithCodex,
   classifyVoiceCommandIntent,
   listCodexThreads,
+  readGatewayRequestStatus,
   startCodexTurn
 } from "./agent-runner.mjs";
 import { normalizeVoiceCommandIntent } from "./codex-runner.mjs";
@@ -68,8 +69,53 @@ export function projectBindingKey(config, project) {
   const host = resolveHost(config, project.host ?? "host");
   return JSON.stringify([host.id, host.transport, host.target ?? null, host.workerPath ?? null,
     host.codexBin ?? config.codexBin ?? "codex", project.workspace,
+    ...((!project.engine || project.engine === "codex") && host.codexGateway ? ["gateway", host.codexGateway] : []),
     ...(project.engine && project.engine !== "codex"
       ? [project.engine, project.engine === "opencode" ? project.opencodeUrl ?? null : host.claudeBin ?? config.claudeBin ?? "claude"] : [])]);
+}
+
+function usesCodexGateway(config, project) {
+  return (project.engine ?? "codex") === "codex" && Boolean(resolveHost(config, project.host ?? "host").codexGateway);
+}
+
+export function whatsappRequestId(phoneKey, messageId) {
+  return messageId ? `wa-v1-${createHash("sha256").update(JSON.stringify([phoneKey, messageId])).digest("hex")}` : `relay-${randomUUID()}`;
+}
+
+const GATEWAY_UNRESOLVED = new Set(["prepared", "pending", "uncertain"]);
+
+function rejectGatewayClaim(chat, requestId, claimToken, reason) {
+  const record = chat.gatewayRequests[requestId];
+  if (!claimToken || record?.status !== "prepared" || record.claimToken !== claimToken) return null;
+  Object.assign(record, { status: "not_submitted", reason, updatedAt: new Date().toISOString() });
+  const target = record.target;
+  const bucket = target.scopeType === "btw" ? chat.btw
+    : projectThreadSession(chat.projects[target.projectAlias] ??= defaultProjectSession(), target.threadName, true);
+  bucket.queuedPromptsPaused = true;
+  return record;
+}
+
+function gatewayRequestNotice(record) {
+  return [
+    `Request: ${record.requestId}`,
+    `Gateway status: ${record.status}`,
+    `Computer: ${record.target.hostId} | tool: codex`,
+    `Session: ${record.resultThreadId ?? record.target.threadId ?? "new"}`,
+    `Directory: ${record.target.workspace}`,
+    GATEWAY_UNRESOLVED.has(record.status)
+      ? "Delivery or completion has not been confirmed. This request will not be sent again automatically. Follow-up delivery is held; /status refresh checks without resending."
+      : record.status === "completed"
+        ? "The coding tool completed this request. The prompt will not be submitted again."
+        : record.status === "queued" ? "This message is already queued for its original destination."
+          : record.status === "cancelled" ? "This queued message was cleared before submission."
+            : "This request was not submitted. It will not be submitted automatically."
+  ].join("\n");
+}
+
+function sessionPermissionDescription(config, project, session) {
+  return usesCodexGateway(config, project)
+    ? "native (existing Codex session rules; relay sandbox settings are not applied)"
+    : resolveSessionPermissionLevel(config, project, session);
 }
 
 function providerConnectionKey(config, project) {
@@ -1477,7 +1523,7 @@ export class WhatsAppControllerBridge {
     configStore = new ControllerConfigStore(),
     stateStore = new ControllerStateStore(),
     fileService = relayFiles,
-    runner = { listCodexThreads, startCodexTurn }
+    runner = { listCodexThreads, startCodexTurn, readGatewayRequestStatus }
   }) {
     this.runtime = runtime;
     this.configStore = configStore;
@@ -1512,6 +1558,104 @@ export class WhatsAppControllerBridge {
   getActiveProject(phoneKey) {
     const chatSession = this.getChatSession(phoneKey);
     return resolveConfiguredProject(this.configStore.data, chatSession.activeProject);
+  }
+
+  gatewayTarget(project, threadName, scopeType, threadId, forceNewThread) {
+    const config = this.configStore.data;
+    return { hostId: project.host ?? "host", host: structuredClone(resolveHost(config, project.host ?? "host")),
+      engine: "codex", workspace: project.workspace, projectAlias: project.alias, threadName, scopeType,
+      threadId, forceNewThread: Boolean(forceNewThread), bindingKey: projectBindingKey(config, project),
+      connectionKey: providerConnectionKey(config, project) };
+  }
+
+  gatewayBlocker(phoneKey, target, exceptRequestId = null) {
+    for (const [owner, chat] of Object.entries(this.stateStore.data.sessions ?? {})) {
+      for (const record of Object.values(chat.gatewayRequests ?? {})) {
+        if (record.requestId === exceptRequestId || !GATEWAY_UNRESOLVED.has(record.status)) continue;
+        const saved = record.target;
+        const sameSlot = owner === phoneKey && saved.projectAlias === target.projectAlias &&
+          saved.threadName === target.threadName && saved.scopeType === target.scopeType;
+        const sameNative = target.threadId && (record.resultThreadId ?? saved.threadId) === target.threadId && saved.connectionKey === target.connectionKey;
+        if (sameSlot || sameNative) return record;
+      }
+    }
+    return null;
+  }
+
+  async updateGatewayRequest(phoneKey, requestId, patch) {
+    return this.stateStore.mutateSession(phoneKey, (chat) => {
+      const record = chat.gatewayRequests[requestId];
+      if (!record) throw new Error("The durable gateway request is missing; no automatic retry is allowed.");
+      // A failed WhatsApp reply or observer cleanup cannot undo native completion.
+      if (record.status === "completed" && patch.status && patch.status !== "completed") return record;
+      Object.assign(record, patch, { updatedAt: new Date().toISOString() });
+      if (GATEWAY_UNRESOLVED.has(record.status) || record.status === "not_submitted") {
+        const target = record.target;
+        const bucket = target.scopeType === "btw" ? chat.btw
+          : projectThreadSession(chat.projects[target.projectAlias] ??= defaultProjectSession(), target.threadName, true);
+        bucket.queuedPromptsPaused = true;
+      }
+      return structuredClone(record);
+    });
+  }
+
+  async admitGatewayRequest({ phoneKey, requestId, target, prompt, originalPrompt, claimToken = null }) {
+    if (!/^(?:wa-v1-[a-f0-9]{64}|relay-[a-f0-9-]{36})$/.test(requestId)) throw new Error("Invalid durable WhatsApp request ID.");
+    return this.stateStore.mutateSession(phoneKey, (chat) => {
+      const currentProject = this.configStore.data.projects.find((item) => item.alias === target.projectAlias);
+      if (!currentProject || projectBindingKey(this.configStore.data, currentProject) !== target.bindingKey) {
+        const rejected = rejectGatewayClaim(chat, requestId, claimToken, "Queued destination changed before admission.");
+        if (rejected) return { record: structuredClone(rejected), admitted: false };
+        throw new Error("The gateway destination changed before submission; no message was sent.");
+      }
+      const existing = chat.gatewayRequests[requestId];
+      if (existing && !(claimToken && existing.status === "prepared" && existing.claimToken === claimToken)) {
+        return { record: structuredClone(existing), admitted: false };
+      }
+      const blocker = this.gatewayBlocker(phoneKey, target, requestId);
+      if (blocker) {
+        rejectGatewayClaim(chat, requestId, claimToken, "Another request became unresolved before admission.");
+        return { record: structuredClone(blocker), admitted: false };
+      }
+      if (existing && (existing.target.bindingKey !== target.bindingKey || existing.target.threadId !== target.threadId ||
+          existing.target.projectAlias !== target.projectAlias || existing.target.forceNewThread !== target.forceNewThread ||
+          existing.target.threadName !== target.threadName || existing.target.scopeType !== target.scopeType)) {
+        rejectGatewayClaim(chat, requestId, claimToken, "The queued destination changed before submission.");
+        return { record: structuredClone(existing), admitted: false };
+      }
+      const record = { ...existing, requestId, target: structuredClone(target), prompt, originalPrompt,
+        status: "pending", createdAt: existing?.createdAt ?? new Date().toISOString(), updatedAt: new Date().toISOString() };
+      delete record.claimToken;
+      chat.gatewayRequests[requestId] = record;
+      if (target.scopeType === "project") {
+        const slot = projectThreadSession(chat.projects[target.projectAlias] ??= defaultProjectSession(), target.threadName, true);
+        Object.assign(slot, { bindingKey: target.bindingKey, threadId: target.threadId, lastGatewayRequestId: requestId });
+      }
+      return { record: structuredClone(record), admitted: true };
+    });
+  }
+
+  async rejectPreparedGatewayRequest(phoneKey, requestId, claimToken, reason) {
+    if (!claimToken) return;
+    await this.stateStore.mutateSession(phoneKey, (chat) => {
+      rejectGatewayClaim(chat, requestId, claimToken, reason);
+    });
+  }
+
+  async restoreGatewayThread(phoneKey, record, result) {
+    if (record.target.scopeType !== "project" || typeof result.threadId !== "string" || !result.threadId) return false;
+    return this.upsertProjectSession(phoneKey, record.target.projectAlias, {
+      threadName: record.target.threadName,
+      guard: (slot) => {
+        const project = this.configStore.data.projects.find(item => item.alias === record.target.projectAlias);
+        return project && projectBindingKey(this.configStore.data, project) === record.target.bindingKey &&
+          slot.bindingKey === record.target.bindingKey && slot.lastGatewayRequestId === record.requestId &&
+          (slot.threadId === record.target.threadId || slot.threadId === result.threadId);
+      },
+      projectPatch: { threadId: result.threadId,
+        ...(result.completed === true ? { lastReplyAt: new Date().toISOString(),
+          lastReplyPreview: String(result.replyText ?? "").slice(0, 200) } : {}) }
+    });
   }
 
   runnerOptions(project) {
@@ -1606,6 +1750,12 @@ export class WhatsAppControllerBridge {
       const projectState = current.projects[projectAlias] ??= defaultProjectSession();
       const slot = projectThreadSession(projectState, selectedThread, true);
       if (guard && !guard(slot)) return false;
+      if (Array.isArray(projectPatch.queuedPrompts) && !projectPatch.queuedPrompts.length) {
+        for (const queued of slot.queuedPrompts ?? []) {
+          const record = current.gatewayRequests[queued.requestId];
+          if (record?.status === "queued") { record.status = "cancelled"; record.updatedAt = new Date().toISOString(); }
+        }
+      }
       invalidateChangedSelection(current, chatPatch);
       Object.assign(current, chatPatch, { phoneKey });
       Object.assign(slot, projectPatch);
@@ -1673,7 +1823,7 @@ export class WhatsAppControllerBridge {
 
   async enqueueQueuedPrompt({
     phoneKey, remoteJid, label, scopeType = "project", projectAlias = null, threadName = null,
-    prompt, forceNewThread = false, voiceReplyOverride = null, expectedBindingKey = null
+    prompt, forceNewThread = false, voiceReplyOverride = null, expectedBindingKey = null, requestId = null
   }) {
     const trimmedPrompt = String(prompt ?? "").trim();
     if (!trimmedPrompt) return 0;
@@ -1684,8 +1834,10 @@ export class WhatsAppControllerBridge {
     threadName = this.getProjectSession(phoneKey, queuedProject.alias, threadName).threadName;
     const bindingKey = projectBindingKey(this.configStore.data, queuedProject);
     if (expectedBindingKey && expectedBindingKey !== bindingKey) return 0;
+    const gateway = usesCodexGateway(this.configStore.data, queuedProject);
+    if (gateway) requestId ??= whatsappRequestId(phoneKey, null);
     const queuedPrompt = {
-      prompt: trimmedPrompt, projectAlias: queuedProject.alias, bindingKey, threadName,
+      prompt: trimmedPrompt, projectAlias: queuedProject.alias, bindingKey, threadName, requestId,
       forceNewThread, queuedAt: new Date().toISOString(),
       voiceReplyOverride: voiceReplyOverride?.enabled
         ? { enabled: true, speed: voiceReplyOverride.speed ?? null } : null
@@ -1696,6 +1848,13 @@ export class WhatsAppControllerBridge {
       Object.assign(session, { phoneKey, remoteJid, label });
       const bucket = scopeType === "btw" ? session.btw
         : projectThreadSession(session.projects[queuedProject.alias] ??= defaultProjectSession(), threadName, true);
+      if (gateway) {
+        if (session.gatewayRequests[requestId]) return bucket.queuedPrompts.length;
+        session.gatewayRequests[requestId] = { requestId, status: "queued", createdAt: queuedPrompt.queuedAt,
+          originalPrompt: trimmedPrompt,
+          target: this.gatewayTarget(queuedProject, threadName, scopeType,
+            scopeType === "project" && !forceNewThread ? bucket.threadId ?? null : null, forceNewThread) };
+      }
       bucket.queuedPrompts.push(queuedPrompt);
       if (scopeType === "btw") bucket.lastUsedAt = new Date().toISOString();
       return bucket.queuedPrompts.length;
@@ -1708,7 +1867,18 @@ export class WhatsAppControllerBridge {
     return this.stateStore.mutateSession(phoneKey, (session) => {
       const bucket = scopeType === "btw" ? session.btw : projectThreadSession(session.projects[alias], threadName);
       if (bucket?.queuedPromptsPaused) return null;
-      return bucket?.queuedPrompts.shift() ?? null;
+      const next = bucket?.queuedPrompts[0];
+      if (!next) return null;
+      const record = session.gatewayRequests[next.requestId];
+      if (record) {
+        if (record.status !== "queued" || this.gatewayBlocker(phoneKey, record.target, record.requestId)) return null;
+        // Native ID may first become known when the preceding new-session turn completes.
+        if (!record.target.threadId && scopeType === "project" && !record.target.forceNewThread) record.target.threadId = bucket.threadId ?? null;
+        record.status = "prepared";
+        record.claimToken = randomUUID();
+      }
+      bucket.queuedPrompts.shift();
+      return { ...next, gatewayClaimToken: record?.claimToken ?? null };
     });
   }
 
@@ -1718,7 +1888,13 @@ export class WhatsAppControllerBridge {
     return this.stateStore.mutateSession(phoneKey, (session) => {
       const bucket = scopeType === "btw" ? session.btw : projectThreadSession(session.projects[alias], threadName);
       const count = bucket?.queuedPrompts.length ?? 0;
-      if (bucket) { bucket.queuedPrompts = []; bucket.queuedPromptsPaused = false; }
+      if (bucket) {
+        for (const queued of bucket.queuedPrompts) {
+          const record = session.gatewayRequests[queued.requestId];
+          if (record?.status === "queued") { record.status = "cancelled"; record.updatedAt = new Date().toISOString(); }
+        }
+        bucket.queuedPrompts = []; bucket.queuedPromptsPaused = false;
+      }
       return count;
     });
   }
@@ -1734,7 +1910,8 @@ export class WhatsAppControllerBridge {
     forceNewThread = false,
     voiceReplyOverride = null,
     statusPrelude = null,
-    expectedBindingKey = null
+    expectedBindingKey = null,
+    requestId = null
   }) {
     const project = projectAlias
       ? this.configStore.data.projects.find((item) => item.alias === projectAlias)
@@ -1744,6 +1921,18 @@ export class WhatsAppControllerBridge {
       return true;
     }
     threadName = this.getProjectSession(phoneKey, project.alias, threadName).threadName;
+    if (usesCodexGateway(this.configStore.data, project) || Object.keys(this.getChatSession(phoneKey).gatewayRequests).length) {
+      const duplicate = this.getChatSession(phoneKey).gatewayRequests[requestId];
+      if (duplicate) { await this.sendReply(remoteJid, gatewayRequestNotice(duplicate)); return true; }
+      const slot = this.getProjectSession(phoneKey, project.alias, threadName).session;
+      const blocked = this.gatewayBlocker(phoneKey, this.gatewayTarget(project, threadName, scopeType, slot.threadId ?? null, forceNewThread));
+      // An in-flight request may accept follow-ups into its durable queue; after
+      // observer loss/restart, unresolved delivery must never trigger new work.
+      const activeRequest = scopeType === "btw" ? this.btwRun(phoneKey) : this.projectRun(phoneKey, project.alias, threadName);
+      if (blocked && (!activeRequest || activeRequest.requestId !== blocked.requestId)) {
+        await this.sendReply(remoteJid, gatewayRequestNotice(blocked)); return true;
+      }
+    }
     const activeRun =
       scopeType === "btw"
         ? this.btwRun(phoneKey)
@@ -1771,7 +1960,8 @@ export class WhatsAppControllerBridge {
       prompt,
       forceNewThread,
       voiceReplyOverride,
-      expectedBindingKey
+      expectedBindingKey,
+      requestId
     });
     if (!queuedCount) {
       await this.sendReply(remoteJid, "The project destination changed before the message could be queued. Select the intended project and resend it.");
@@ -1833,6 +2023,8 @@ export class WhatsAppControllerBridge {
       projectAlias: queuedPrompt.projectAlias ?? alias,
       threadName: queuedPrompt.threadName ?? threadName,
       expectedBindingKey: queuedPrompt.bindingKey,
+      requestId: queuedPrompt.requestId,
+      gatewayClaimToken: queuedPrompt.gatewayClaimToken,
       voiceReplyOverride: queuedPrompt.voiceReplyOverride ?? null,
       statusPrelude:
         scopeType === "btw"
@@ -2258,6 +2450,13 @@ export class WhatsAppControllerBridge {
       return;
     }
 
+    const requestId = whatsappRequestId(phoneKey, messageId);
+    const duplicateRequest = this.getChatSession(phoneKey).gatewayRequests[requestId];
+    if (duplicateRequest) {
+      await this.sendReply(remoteJid, gatewayRequestNotice(duplicateRequest));
+      return;
+    }
+
     const messageType = extractMessageType(message.message);
     const audioMessage = extractAudioMessage(message.message);
     const extractedText = extractMessageText(message.message).trim();
@@ -2284,7 +2483,7 @@ export class WhatsAppControllerBridge {
 
     const attachment = extractAttachment(message.message);
     if (attachment) {
-      await this.handleAttachmentMessage({ message, attachment, phoneKey, remoteJid, label, project: activeProject, threadName: inboundThreadName });
+      await this.handleAttachmentMessage({ requestId, message, attachment, phoneKey, remoteJid, label, project: activeProject, threadName: inboundThreadName });
       return;
     }
 
@@ -2462,7 +2661,8 @@ export class WhatsAppControllerBridge {
         );
         return;
       case "status":
-        await this.sendReply(remoteJid, this.renderSessionStatus(phoneKey, command.payload));
+        if (String(command.payload).trim().toLowerCase() === "refresh") await this.refreshGatewayStatus(phoneKey, remoteJid);
+        else await this.sendReply(remoteJid, this.renderSessionStatus(phoneKey, command.payload));
         return;
       case "stop":
         await this.stopActiveRun(phoneKey, remoteJid, command.payload);
@@ -2477,10 +2677,18 @@ export class WhatsAppControllerBridge {
         return;
       case "new":
         {
+          if (usesCodexGateway(config, activeProject) || Object.keys(this.getChatSession(phoneKey).gatewayRequests).length) {
+            const slot = this.getProjectSession(phoneKey, activeProject.alias, inboundThreadName).session;
+            const blocked = this.gatewayBlocker(phoneKey, this.gatewayTarget(activeProject, inboundThreadName, "project", slot.threadId ?? null, false));
+            if (blocked && !this.projectRun(phoneKey, activeProject.alias, inboundThreadName)) {
+              await this.sendReply(remoteJid, gatewayRequestNotice(blocked)); return;
+            }
+          }
           const activeRun = this.projectRun(phoneKey, activeProject.alias, inboundThreadName);
           if (activeRun) {
             if (command.prompt) {
               await this.queuePromptIfBusy({
+              requestId,
                 phoneKey,
                 remoteJid,
                 label,
@@ -2510,6 +2718,7 @@ export class WhatsAppControllerBridge {
         }
         if (command.prompt) {
           await this.runPrompt({
+            requestId,
             phoneKey,
             remoteJid,
             prompt: command.prompt,
@@ -2568,6 +2777,7 @@ export class WhatsAppControllerBridge {
           const targetThreadName = this.getProjectSession(phoneKey, targetProject.alias, parsed.threadName).threadName;
           if (
             await this.queuePromptIfBusy({
+              requestId,
               phoneKey,
               remoteJid,
               label,
@@ -2585,6 +2795,7 @@ export class WhatsAppControllerBridge {
           }
 
           await this.runPrompt({
+            requestId,
             phoneKey,
             remoteJid,
             prompt: parsed.prompt,
@@ -2602,6 +2813,7 @@ export class WhatsAppControllerBridge {
       case "btw":
         if (
           await this.queuePromptIfBusy({
+              requestId,
             phoneKey,
             remoteJid,
             label,
@@ -2618,6 +2830,7 @@ export class WhatsAppControllerBridge {
           return;
         }
         await this.runPrompt({
+            requestId,
           phoneKey,
           remoteJid,
           prompt: command.prompt,
@@ -2656,6 +2869,7 @@ export class WhatsAppControllerBridge {
       case "prompt":
         if (
           await this.queuePromptIfBusy({
+              requestId,
             phoneKey,
             remoteJid,
             label,
@@ -2672,6 +2886,7 @@ export class WhatsAppControllerBridge {
           return;
         }
         await this.runPrompt({
+            requestId,
           phoneKey,
           remoteJid,
           prompt: command.prompt,
@@ -2902,7 +3117,7 @@ export class WhatsAppControllerBridge {
       await this.sendReply(remoteJid, [
         `Selected session ${choice.name || shortThreadId(choice.id)}.`,
         `Computer: ${host.id} | tool: ${choice.engine}`, `Directory: ${project.workspace}`,
-        `Session: ${choice.id}`, `Permissions: ${resolveSessionPermissionLevel(this.configStore.data, project, this.getProjectSession(phoneKey, project.alias, selectedName).session)}`,
+        `Session: ${choice.id}`, `Permissions: ${sessionPermissionDescription(this.configStore.data, project, this.getProjectSession(phoneKey, project.alias, selectedName).session)}`,
         "Send a normal message to continue here. Messages and uploads use this directory."
       ].join("\n"));
     } catch (error) {
@@ -2962,7 +3177,7 @@ export class WhatsAppControllerBridge {
     };
   }
 
-  async handleAttachmentMessage({ message, attachment, phoneKey, remoteJid, label, project, threadName = null }) {
+  async handleAttachmentMessage({ requestId = null, message, attachment, phoneKey, remoteJid, label, project, threadName = null }) {
     threadName = this.getProjectSession(phoneKey, project.alias, threadName).threadName;
     const expectedBindingKey = projectBindingKey(this.configStore.data, project);
     try {
@@ -2980,7 +3195,7 @@ export class WhatsAppControllerBridge {
         `Media type: ${JSON.stringify(saved.mimetype)}`,
         "User request:", attachment.caption
       ].join("\n");
-      const request = { phoneKey, remoteJid, label, scopeType: "project", projectAlias: project.alias, threadName, prompt, forceNewThread: false, expectedBindingKey };
+      const request = { requestId, phoneKey, remoteJid, label, scopeType: "project", projectAlias: project.alias, threadName, prompt, forceNewThread: false, expectedBindingKey };
       if (!(await this.queuePromptIfBusy(request))) await this.runPrompt(request);
     } catch (error) {
       await this.sendReply(remoteJid, `Attachment handling failed on ${project.host ?? "host"} / ${project.alias}: ${error.message}`);
@@ -3035,7 +3250,7 @@ export class WhatsAppControllerBridge {
       ...config.projects.filter((project) => (project.host ?? "host") === (activeProject.host ?? "host")).flatMap((project) => {
         const projectSession = this.getProjectSession(phoneKey, project.alias).session;
         const run = this.projectRun(phoneKey, project.alias);
-        const permissionLevel = resolveSessionPermissionLevel(
+        const permissionLevel = sessionPermissionDescription(
           config,
           project,
           projectSession
@@ -3060,7 +3275,7 @@ export class WhatsAppControllerBridge {
     if (!spec) {
       const activeProject = this.getActiveProject(phoneKey);
       const { session } = this.getProjectSession(phoneKey, activeProject.alias);
-      const permissionLevel = resolveSessionPermissionLevel(
+      const permissionLevel = sessionPermissionDescription(
         this.configStore.data,
         activeProject,
         session
@@ -3110,7 +3325,7 @@ export class WhatsAppControllerBridge {
 
     const project = ensured.project;
     const { session } = this.getProjectSession(phoneKey, project.alias);
-    const permissionLevel = resolveSessionPermissionLevel(this.configStore.data, project, session);
+    const permissionLevel = sessionPermissionDescription(this.configStore.data, project, session);
     await this.upsertChatSession(phoneKey, {
       phoneKey,
       remoteJid,
@@ -3144,6 +3359,9 @@ export class WhatsAppControllerBridge {
 
     const project = ensured.project;
     const activeRun = this.projectRun(phoneKey, project.alias);
+    const selected = this.getProjectSession(phoneKey, project.alias);
+    const blocked = this.gatewayBlocker(phoneKey, this.gatewayTarget(project, selected.threadName, "project", selected.session.threadId ?? null, false));
+    if (blocked) { await this.sendReply(remoteJid, gatewayRequestNotice(blocked)); return; }
     if (activeRun) {
       await this.sendReply(
         remoteJid,
@@ -3168,6 +3386,42 @@ export class WhatsAppControllerBridge {
         "Next: your next normal message here will start a new Codex thread in that project."
       ].join("\n")
     );
+  }
+
+  async refreshGatewayStatus(phoneKey, remoteJid) {
+    const records = Object.values(this.getChatSession(phoneKey).gatewayRequests ?? {}).filter((record) => GATEWAY_UNRESOLVED.has(record.status) ||
+      (record.status === "completed" && record.replyDelivery !== "sent"));
+    if (!records.length) { await this.sendReply(remoteJid, "No unresolved gateway requests.\n" + this.renderSessionStatus(phoneKey)); return; }
+    if (typeof this.runner.readGatewayRequestStatus !== "function") {
+      await this.sendReply(remoteJid, "Read-only gateway reconciliation is unavailable. No requests were resent.\n" + records.map(gatewayRequestNotice).join("\n\n")); return;
+    }
+    for (const record of records) {
+      try {
+        const result = await this.runner.readGatewayRequestStatus({ engine: "codex", host: record.target.host,
+          requestId: record.requestId, threadId: record.target.threadId, workspace: record.target.workspace });
+        const expectedThreadId = record.resultThreadId ?? record.target.threadId;
+        if (result?.requestId !== record.requestId || result.readOnly !== true ||
+            (expectedThreadId && result.threadId && expectedThreadId !== result.threadId)) {
+          throw new Error("The gateway status did not match the saved request and conversation.");
+        }
+        const observer = [...this.activeRuns.values()].find((run) => run.requestId === record.requestId);
+        const status = result.completed === true ? "completed"
+          : !observer && result.inProgress !== true && result.promptSubmitted === false && result.deliveryUncertain !== true ? "not_submitted" : "uncertain";
+        const updated = await this.updateGatewayRequest(phoneKey, record.requestId, { status,
+          resultThreadId: result.threadId ?? record.target.threadId, reconciledAt: new Date().toISOString() });
+        await this.restoreGatewayThread(phoneKey, record, result);
+        if (status === "completed" && observer?.stopUnconfirmed) {
+          observer.nativeOutcomeConfirmed = true;
+          for (const [key, run] of this.activeRuns) if (run === observer) this.activeRuns.delete(key);
+        }
+        const completedText = status === "completed" && typeof result.replyText === "string" ? result.replyText : null;
+        await this.sendReply(remoteJid, [gatewayRequestNotice(updated), completedText,
+          "This check did not submit a message. Held follow-ups remain held; /stop clears them."].filter(Boolean).join("\n\n"));
+        if (status === "completed") await this.updateGatewayRequest(phoneKey, record.requestId, { replyDelivery: "sent" });
+      } catch (error) {
+        await this.sendReply(remoteJid, `Could not reconcile request ${record.requestId}: ${error.message}\nNo message was resent; its previous delivery status remains unchanged.`);
+      }
+    }
   }
 
   renderSessionStatus(phoneKey, payload = "") {
@@ -3211,6 +3465,9 @@ export class WhatsAppControllerBridge {
         ? projectSession.pendingPermissionConfirmation
         : null;
     const busyProjects = this.activeProjectRuns(phoneKey).map((item) => `${item.projectAlias}/${item.threadName}`);
+    const unresolved = Object.values(chatSession.gatewayRequests ?? {}).filter((record) => (GATEWAY_UNRESOLVED.has(record.status) ||
+      (record.status === "completed" && record.replyDelivery !== "sent")) &&
+      record.target.projectAlias === project.alias && record.target.threadName === threadName);
 
     return [
       "WhatsApp Codex bridge",
@@ -3227,7 +3484,8 @@ export class WhatsAppControllerBridge {
         threadName
       })}`,
       projectSession.queuedPromptsPaused && projectSession.queuedPrompts?.length ? "queued_messages_held: yes (not submitted; /stop clears them)" : null,
-      `permissions: ${permissionLevel}`,
+      `permissions: ${sessionPermissionDescription(config, project, projectSession)}`,
+      ...unresolved.map((record) => `gateway_request: ${record.requestId} (${record.status}; ${record.status === "completed" ? "reply delivery unconfirmed" : "follow-up delivery held"}; /status refresh checks without resending)`),
       `voice_reply: ${formatVoiceReplySummary(voiceReply)}`,
       `voice_reply_provider: ${resolveConfiguredTtsProvider(config)}`,
       busyProjects.length ? `busy_projects: ${busyProjects.join(", ")}` : null,
@@ -3585,6 +3843,10 @@ export class WhatsAppControllerBridge {
     const currentLevel = resolveSessionPermissionLevel(config, project, session);
     const trimmedPayload = String(payload ?? "").trim();
 
+    if (usesCodexGateway(config, project)) {
+      await this.sendReply(remoteJid, `Computer: ${project.host ?? "host"} | tool: codex\nDirectory: ${project.workspace}\nPermissions: native. The shared gateway preserves the existing Codex conversation's permission rules. Relay sandbox changes are not applied; manage permissions in the owning Codex client.`);
+      return;
+    }
     if (project.engine === "opencode" || project.engine === "claude") {
       await this.sendReply(remoteJid, `Permissions for ${project.alias}/${threadName}: native. ${project.engine} uses its existing permission rules; this relay does not apply a Codex sandbox. Configure permission rules in that coding tool.`);
       return;
@@ -3840,7 +4102,10 @@ export class WhatsAppControllerBridge {
         [target.targetType === "btw"
           ? "No relay turn is active for btw."
           : `No relay turn is active for ${project.alias}/${threadName}. The conversation is preserved.`,
-        clearedQueued ? `Cleared ${clearedQueued} queued follow-up message${clearedQueued === 1 ? "" : "s"}.` : null
+        clearedQueued ? `Cleared ${clearedQueued} queued follow-up message${clearedQueued === 1 ? "" : "s"}.` : null,
+        ...Object.values(this.getChatSession(phoneKey).gatewayRequests ?? {}).filter((record) => GATEWAY_UNRESOLVED.has(record.status) &&
+          record.target.projectAlias === project.alias && record.target.threadName === threadName).map((record) =>
+          `Request ${record.requestId} is still ${record.status}. No native interruption was confirmed. /status refresh checks its outcome without resending.`)
         ].filter(Boolean).join("\n")
       );
       return;
@@ -3908,7 +4173,9 @@ export class WhatsAppControllerBridge {
     threadName = null,
     voiceReplyOverride = null,
     statusPrelude = null,
-    expectedBindingKey = null
+    expectedBindingKey = null,
+    requestId = null,
+    gatewayClaimToken = null
   }) {
     const config = this.configStore.data;
     const chatSession = this.getChatSession(phoneKey);
@@ -3916,6 +4183,7 @@ export class WhatsAppControllerBridge {
       ? config.projects.find((item) => item.alias === projectAlias)
       : resolveConfiguredProject(config, chatSession.activeProject ?? config.defaultProject);
     if (!project) {
+      await this.rejectPreparedGatewayRequest(phoneKey, requestId, gatewayClaimToken, "Queued destination was removed.");
       await this.sendReply(remoteJid, "The selected project is no longer configured. Use /projects to select a destination.");
       return;
     }
@@ -3923,6 +4191,7 @@ export class WhatsAppControllerBridge {
     const scopeLabel = this.sessionScopeLabel(phoneKey, project, threadName);
     const bindingKey = projectBindingKey(config, project);
     if (expectedBindingKey && expectedBindingKey !== bindingKey) {
+      await this.rejectPreparedGatewayRequest(phoneKey, requestId, gatewayClaimToken, "Queued destination changed.");
       await this.sendReply(remoteJid, `The destination for ${project.alias} changed. The queued message was not sent. Select the intended host/project and resend it.`);
       return;
     }
@@ -3930,6 +4199,7 @@ export class WhatsAppControllerBridge {
       scopeType === "btw" ? btwRunKey(phoneKey) : projectRunKey(phoneKey, project.alias, threadName);
     const active = this.activeRuns.get(runKey);
     if (active) {
+      await this.rejectPreparedGatewayRequest(phoneKey, requestId, gatewayClaimToken, "Another relay turn is active.");
       const scopeLabel =
         scopeType === "btw"
           ? "btw"
@@ -3963,12 +4233,20 @@ export class WhatsAppControllerBridge {
         : defaultProjectSession();
     const existingThreadId =
       scopeType === "project" && !forceNewThread ? projectSession.threadId ?? null : null;
+    const unresolvedGateway = this.gatewayBlocker(phoneKey,
+      this.gatewayTarget(project, threadName, scopeType, existingThreadId, forceNewThread), gatewayClaimToken ? requestId : null);
+    if (unresolvedGateway) {
+      await this.rejectPreparedGatewayRequest(phoneKey, requestId, gatewayClaimToken, "Another request is unresolved.");
+      await this.sendReply(remoteJid, gatewayRequestNotice(unresolvedGateway)); return;
+    }
     if (existingThreadId && (projectSession.bindingKey ? projectSession.bindingKey !== bindingKey :
       resolveHost(config, project.host ?? "host").transport !== "local" || (project.engine && project.engine !== "codex"))) {
+      await this.rejectPreparedGatewayRequest(phoneKey, requestId, gatewayClaimToken, "The native conversation binding changed.");
       await this.sendReply(remoteJid, `The destination for ${project.alias} changed. Use /sessions and /session to reconnect on ${project.host ?? "host"}, or /new to start a fresh session.`);
       return;
     }
     if (existingThreadId && this.nativeThreadBusy(project, existingThreadId, runKey)) {
+      await this.rejectPreparedGatewayRequest(phoneKey, requestId, gatewayClaimToken, "The native conversation is busy in another relay slot.");
       await this.sendReply(remoteJid, `That native session is already running in another relay slot. Wait for it to finish or use /new in ${project.alias}/${threadName}.`);
       return;
     }
@@ -3987,6 +4265,14 @@ export class WhatsAppControllerBridge {
     const promptForCodex = activeVoiceReply.enabled
       ? buildVoiceReplyPrompt(prompt)
       : prompt;
+    const gateway = usesCodexGateway(config, project);
+    if (gateway) {
+      requestId ??= whatsappRequestId(phoneKey, null);
+      const admitted = await this.admitGatewayRequest({ phoneKey, requestId,
+        target: this.gatewayTarget(project, threadName, scopeType, existingThreadId, forceNewThread),
+        prompt: promptForCodex, originalPrompt: prompt, claimToken: gatewayClaimToken });
+      if (!admitted.admitted) { await this.sendReply(remoteJid, gatewayRequestNotice(admitted.record)); return; }
+    }
     let activeRun;
     const destinationUnchanged = () => {
       const current = this.configStore.data.projects.find((item) => item.alias === project.alias);
@@ -4009,6 +4295,7 @@ export class WhatsAppControllerBridge {
         host: resolveHost(config, project.host ?? "host"),
         workspace: project.workspace,
         prompt: promptForCodex,
+        ...(gateway ? { requestId } : {}),
         threadId: existingThreadId,
         threadName: existingThreadId
           ? null
@@ -4082,6 +4369,12 @@ export class WhatsAppControllerBridge {
         }
       });
     } catch (error) {
+      if (gateway) {
+        const safe = error.promptSubmitted === false && error.deliveryUncertain !== true && error.code !== "ERR_CODEX_GATEWAY_UNCERTAIN";
+        const record = await this.updateGatewayRequest(phoneKey, requestId, { status: safe ? "not_submitted" : "uncertain", error: error.message });
+        await this.sendReply(remoteJid, `${gatewayRequestNotice(record)}\n${error.message}`);
+        return;
+      }
       await this.sendReply(remoteJid, `Could not start ${scopeLabel}: ${error.message}`);
       return;
     }
@@ -4094,6 +4387,7 @@ export class WhatsAppControllerBridge {
     }, () => { resultSettled = true; });
 
     activeRun = {
+      requestId: gateway ? requestId : null,
       bindingKey,
       providerConnectionKey: providerConnectionKey(this.configStore.data, project),
       child,
@@ -4129,6 +4423,7 @@ export class WhatsAppControllerBridge {
           },
           projectPatch: {
             bindingKey,
+            lastGatewayRequestId: gateway ? requestId : null,
             permissionLevel,
             pendingPermissionConfirmation: null,
             lastPromptAt: new Date().toISOString(),
@@ -4158,13 +4453,21 @@ export class WhatsAppControllerBridge {
             `Computer: ${project.host ?? "host"} | tool: ${project.engine ?? "codex"}`,
             `Session: ${existingThreadId ? `${projectSession.connectedThreadName ? `${projectSession.connectedThreadName} — ` : ""}${existingThreadId}` : "new"}`,
             `Directory: ${project.workspace}`,
-            `Relay slot: ${scopeType === "btw" ? "btw" : `${project.alias}/${threadName}`} | permissions: ${permissionLevel}`,
+            `Relay slot: ${scopeType === "btw" ? "btw" : `${project.alias}/${threadName}`} | permissions: ${sessionPermissionDescription(config, project, projectSession)}`,
+            gateway ? `Request: ${requestId}` : null,
             scopeLabel !== activeScopeAtDispatch ? `Your selected session is unchanged (${activeScopeAtDispatch}).` : null
           ].filter(Boolean).join("\n")
         )
       );
 
       const result = await resultPromise;
+      if (gateway) {
+        if (result.requestId !== requestId || (existingThreadId && result.threadId !== existingThreadId)) {
+          throw Object.assign(new Error("The gateway reply did not match the saved request and conversation."), { deliveryUncertain: true });
+        }
+        await this.updateGatewayRequest(phoneKey, requestId, { status: "completed", resultThreadId: result.threadId,
+          completedAt: new Date().toISOString(), replyDelivery: "pending" });
+      }
       if (activeRun.cancelled || !ownsRun()) return;
       if (!destinationUnchanged()) {
         await this.sendReply(remoteJid, "The coding tool finished on the previous project destination. Its result was not attached to the changed project; reconnect to the original machine to inspect that session.");
@@ -4254,6 +4557,7 @@ export class WhatsAppControllerBridge {
                 )
           );
         }
+        if (gateway) await this.updateGatewayRequest(phoneKey, requestId, { replyDelivery: "sent" });
         return;
       }
 
@@ -4270,7 +4574,20 @@ export class WhatsAppControllerBridge {
               replyText
             )
       );
+      if (gateway) await this.updateGatewayRequest(phoneKey, requestId, { replyDelivery: "sent" });
     } catch (error) {
+      if (gateway) {
+        activeRun.suppressQueueDrain = true;
+        const safe = error.promptSubmitted === false && error.deliveryUncertain !== true && error.code !== "ERR_CODEX_GATEWAY_UNCERTAIN";
+        const record = await this.updateGatewayRequest(phoneKey, requestId, { status: safe ? "not_submitted" : "uncertain", error: error.message });
+        if (record.status === "completed") {
+          await this.updateGatewayRequest(phoneKey, requestId, { replyDelivery: "uncertain" });
+          await this.sendReply(remoteJid, `Request ${requestId} completed in Codex, but WhatsApp reply delivery could not be confirmed. The prompt will not be resent. Inspect the original conversation. ${error.message}`).catch(() => {});
+        } else {
+          await this.sendReply(remoteJid, `${gatewayRequestNotice(record)}\n${error.message}`).catch(() => {});
+        }
+        return;
+      }
       if (activeRun.cancelled || !ownsRun()) {
         return;
       }

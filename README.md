@@ -6,8 +6,10 @@ This fork adds one WhatsApp gateway for Codex, OpenCode/OpenChamber and Claude C
 
 Start with [the host/VM setup guide](docs/host-vm.md), [named sessions and coding tools](docs/multiple-agents.md), and [example configuration](examples/controller-config.host-vm.json). This uses each machine's existing accounts, instructions and Hindsight connections, with no additional agent framework or memory store.
 
+This preview also includes an opt-in [shared Codex gateway adapter](docs/shared-codex-gateway.md) for reaching desktop-owned sessions. It requires a separately installed, verified gateway on each computer. This experimental integration is not enabled by the standard installation.
+
 ```powershell
-git clone --branch v0.7.1 https://github.com/whyaaronbailey/codex-whatsapp-relay.git
+git clone --branch v0.8.0 https://github.com/whyaaronbailey/codex-whatsapp-relay.git
 cd codex-whatsapp-relay
 npm ci
 npm run check
@@ -33,12 +35,12 @@ Use this repository as the source:
 https://github.com/whyaaronbailey/codex-whatsapp-relay
 
 Install the current release tag:
-v0.7.1
+v0.8.0
 
 Do all of the following:
 
 1. Clone the repo into ~/.codex/plugins/whatsapp-relay if it does not exist yet.
-2. If it already exists, fetch tags and check out v0.7.1 without deleting unrelated user files.
+2. If it already exists, fetch tags and check out v0.8.0 without deleting unrelated user files.
 3. Run npm ci inside ~/.codex/plugins/whatsapp-relay.
 4. Resolve the absolute path to scripts/launch.mjs in that checkout.
 5. Register it with: codex mcp add whatsapp-relay -- node <absolute-launcher-path> mcp
@@ -125,7 +127,7 @@ Uploads are stored under `<directory>/.whatsapp-relay/inbox`; returned files are
 
 Only explicitly allowed direct-chat senders can control the relay. Credentials under `plugins/whatsapp-relay/data/auth*` are private runtime data. Codex defaults to `workspace-write`; OpenCode and Claude Code retain their native permission systems. Selecting an existing session does not import a stronger permission grant from that conversation. Full Codex access still requires the existing explicit confirmation flow.
 
-The Codex adapter starts a separate native app-server for each relay run. A conversation still loaded by the Codex desktop app or another client can reject resumption with `already has an active writer`, even after its current turn finishes. Session listing and selection do not establish write access. Simultaneous control of a desktop-owned Codex conversation is not supported by this adapter.
+The default Codex adapter starts a separate native app-server for each relay run. A conversation still loaded by the Codex desktop app or another client can reject resumption with `already has an active writer`, even after its current turn finishes. Session listing and selection do not establish write access. Simultaneous control requires the separately configured [shared gateway adapter](docs/shared-codex-gateway.md), whose prerequisites and limitations differ from this default mode.
 
 If this happens, the relay preserves the original conversation, leaves your selection unchanged and reports that the message was not submitted. To continue that same conversation, let desktop work finish, then fully quit the owning Codex client on that computer before resending your message. Merely switching conversations or waiting for a turn to finish may not release ownership. Alternatively, `/new <prompt>` deliberately starts a separate conversation in the selected directory, without the old conversation's history. The relay never removes native locks, closes another client or silently forks your conversation. Separate directories or worktrees are appropriate when simultaneous conversations should not edit the same files.
 

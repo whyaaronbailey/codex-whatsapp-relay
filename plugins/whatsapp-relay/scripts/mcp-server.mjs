@@ -365,6 +365,10 @@ server.tool(
       transport: z.enum(["local", "ssh"]).optional(),
       platform: z.enum(["win32", "linux", "darwin", "windows", "posix"]).optional(),
       codexBin: z.string().min(1).optional(),
+      codexGateway: z.object({
+        pythonBin: z.string().min(1).optional(),
+        configPath: z.string().min(1)
+      }).strict().optional(),
       claudeBin: z.string().min(1).optional(),
       target: z.string().min(1).optional(),
       workerPath: z.string().min(1).optional(),
