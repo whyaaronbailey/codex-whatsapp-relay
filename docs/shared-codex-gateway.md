@@ -4,6 +4,25 @@ This experimental adapter lets the WhatsApp controller connect to the same Codex
 
 The default adapter continues to start its own app-server. Enable the shared adapter only after the gateway can prove that the desktop is connected to its loopback backend. A desktop using its ordinary private connection cannot be attached merely by enabling this setting. Switching that desktop to the gateway may require a one-time quit and relaunch after its current work finishes.
 
+### Current activation blockers
+
+Live validation of the v0.8.0 preview found that a verified desktop WebSocket connection is insufficient for activation:
+
+- An independently launched backend can lose the desktop's app-tools bootstrap context. In the tested Windows installation, app-tools MCP failed because `CODEX_APP_TOOLS_PIPE_PATH` was absent, removing native chat and automation controls. Retaining startup feature flags did not preserve these tools. Repeatedly restarting the same launcher does not resolve the missing context.
+- Creating a new paginated-history conversation succeeded, but history inspection before its first prompt failed with `missing source rollout`. The prompt was not submitted. New-session delivery needs a validated first-turn flow; do not interpret that error as empty history for arbitrary existing conversations or automatically retry uncertain creation attempts.
+
+Shared activation remains on hold in that installation. Keep each route disabled until both native desktop tools and a complete message/reply test pass on that machine. The standard adapter can still work with conversations it owns; it cannot take over a conversation held by the desktop.
+
+### Desktop-owned bridge candidate
+
+The development branch includes an alternative Windows transport under `scripts/stage-desktop-owned-bridge.mjs` and `plugins/whatsapp-relay/scripts/desktop-owned-bridge.mjs`. The desktop launches a small executable shim through its installed `CODEX_CLI_PATH` override. The shim delegates to the native backend using the desktop's original arguments and inherited environment. The broker passes the desktop's stdio traffic through and exposes a capability-protected loopback WebSocket for the gateway. It does not copy or reconstruct private desktop bootstrap values.
+
+The desktop performs the native initialization and receives every server-originated tool or approval request. Gateway connections have a restricted method list, separate request IDs and bounded message queues. Closing a gateway connection does not cancel or replay a native turn. Normal desktop EOF closes the native stdin pipe; the bridge never force-stops the backend.
+
+This is an experimental compatibility layer, not a confirmed native multi-client feature. The `CODEX_CLI_PATH` override and package/sandbox behavior require validation against the installed desktop version. Staging and offline tests do not establish native tool parity. Do not enable the route until the actual desktop-owned process chain, tools and message/reply round trip have passed validation on that machine.
+
+The bridge worker configuration additionally requires `transportTokenFile`, an absolute local path to a private 64-character base64url capability. Generate it independently on each machine from 48 random bytes and restrict its Windows ACL to the user and SYSTEM. Do not send it through WhatsApp, copy it between machines, or commit it. The gateway transport must support authenticated WebSocket handshakes, and new-session delivery requires the upgraded gateway core's `send_created` method.
+
 ## Installation contract
 
 Install the same relay revision on both machines. Each machine needs Python 3.11 or newer and its own verified gateway installation containing `gateway_core.py`, `gateway_runtime.py`, and `vm-test/rpc_probe.py`. The gateway code is an external dependency and is not bundled in this repository. Its runtime verifier must accept explicit `expected_computer` and `expected_host` arguments for VM use. Use the native user's normal Codex home and preserve their existing tools and settings.

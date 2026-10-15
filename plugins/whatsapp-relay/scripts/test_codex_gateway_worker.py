@@ -1,8 +1,10 @@
 """Portable offline contract tests; no installed gateway, desktop or model needed."""
 import contextlib
+import base64
 import copy
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -50,6 +52,7 @@ class Core:
 
     def __init__(self):
         self.send_calls, self.collect_calls, self.destinations = [], [], []
+        self.created_send_calls = []
         self.receipt = {"request_id": REQUEST, "state": "response_completed", "attempted": True,
             "accepted": True, "persisted": True, "reply_complete": True, "turn_id": "turn-one",
             "completion_status": "completed", "replies": [{"phase": "final_answer", "text": "ACK " + REQUEST + "\nDone."}]}
@@ -70,6 +73,13 @@ class Core:
         owner = self
 
         class Gateway:
+            def send_created(self, *args, rpc, creation_response, creation_proof, **kwargs):
+                assert rpc._gateway_creation_response is creation_response
+                assert not getattr(rpc, "_gateway_first_turn_used", False)
+                rpc._gateway_first_turn_used = True
+                owner.created_send_calls.append({"threadId": args[2], "rpc": rpc})
+                return self.send(*args, **kwargs)
+
             def send(self, request_id, host, thread_id, message, sender, **kwargs):
                 destination = next(d for d in destinations if d["host"] == host and d["thread_id"] == thread_id)
                 if "allowed_senders" in destination and sender["id"] not in destination["allowed_senders"]:
@@ -157,6 +167,28 @@ class Backend:
         return Rpc()
 
 
+class HandshakeSocket:
+    """In-memory HTTP upgrade; never opens a network connection."""
+    def __init__(self, response=None):
+        self.response = response
+        self.sent = []
+        self.closed = False
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, _limit):
+        if self.response is not None:
+            return self.response
+        headers = dict(line.split(": ", 1) for line in self.sent[0].decode("ascii").split("\r\n")[1:] if ": " in line)
+        accept = base64.b64encode(hashlib.sha1((headers["Sec-WebSocket-Key"] +
+            "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest())
+        return b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+
+    def close(self):
+        self.closed = True
+
+
 class WorkerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -209,6 +241,43 @@ class WorkerTests(unittest.TestCase):
         self.runtime.fail = True
         self.assert_error("owner_admission_failed", lambda: self.adapter().list_sessions({}))
         self.assertFalse(self.backend.calls)
+
+    def test_missing_or_invalid_transport_token_refuses_before_connect(self):
+        path = self.root / "private-token"
+        self.config["transportTokenFile"] = str(path)
+        self.assert_error("transport_token_unavailable", self.adapter)
+        for token in (b"a" * 63, b"a" * 65, b"a" * 64 + b"\r\nInjected: yes", b"a" * 64 + b"\n\n", b"a" * 10000):
+            with self.subTest(length=len(token)):
+                path.write_bytes(token)
+                error = self.assert_error("invalid_transport_token", self.adapter)
+                self.assertNotIn("a" * 63, json.dumps(error))
+        self.assertFalse(self.backend.calls)
+        self.assertFalse(self.core.send_calls)
+
+    def test_transport_token_file_must_be_absolute(self):
+        self.config["transportTokenFile"] = "relative-token"
+        self.assert_error("invalid_config", self.adapter)
+        self.assertFalse(self.backend.calls)
+
+    def test_transport_auth_is_header_only_and_no_auth_call_shape_is_preserved(self):
+        token = "aA0_-" * 12 + "abcd"
+        path = self.root / "private-token"
+        endpoint = self.binding.manifest["endpoint"]
+        for suffix in (None, b"", b"\n", b"\r\n"):
+            with self.subTest(suffix=suffix):
+                if suffix is None:
+                    self.config.pop("transportTokenFile", None)
+                else:
+                    path.write_bytes(token.encode("ascii") + suffix)
+                    self.config["transportTokenFile"] = str(path)
+                websocket = object()
+                with patch.object(self.core._transport, "WebSocket", return_value=websocket, create=True) as connect, \
+                     patch.object(self.core._transport, "Rpc", return_value=self.backend.factory(endpoint), create=True) as rpc:
+                    adapter = w.Adapter(self.config, core=self.core, runtime=self.runtime, binding=self.binding)
+                    adapter.rpc_factory(endpoint).close()
+                    connect.assert_called_once_with(endpoint, **({} if suffix is None else {"bearer_token": token}))
+                    rpc.assert_called_once_with(websocket)
+                    self.assertNotIn(token, json.dumps(adapter.config))
 
     def test_vm_proof_uses_configured_real_computer_and_host(self):
         self.config.update(host="vm", expectedComputer="TEST-VM")
@@ -298,6 +367,73 @@ class WorkerTests(unittest.TestCase):
         adapter.create_session(self.params, self.events.append)
         self.assertEqual(sum(method == "thread/start" for method, _ in self.backend.calls), 1)
         self.assertEqual({c["threadId"] for c in self.core.send_calls}, {NEW_THREAD})
+        self.assertEqual(len(self.core.created_send_calls), 1)
+
+    def test_creation_with_existing_delivery_receipt_cannot_create_or_use_handoff(self):
+        self.config["allowCreateSessions"] = True
+        atomic_json(self.root / "ledger" / (REQUEST + ".json"), {"request_id": REQUEST})
+        self.assert_error("request_id_collision", lambda: self.adapter().create_session(self.params, self.events.append))
+        self.assertFalse(self.backend.calls)
+        self.assertFalse(self.core.created_send_calls)
+
+    def test_core_without_first_turn_support_refuses_before_creation(self):
+        self.config["allowCreateSessions"] = True
+        with patch.object(self.core, "Gateway", return_value=types.SimpleNamespace(send=lambda *_: None)):
+            self.assert_error("first_turn_unsupported", lambda: self.adapter().create_session(self.params, self.events.append))
+        self.assertFalse(self.backend.calls)
+
+    def test_creation_connection_stays_open_until_first_delivery_completes(self):
+        self.config["allowCreateSessions"] = True
+        adapter = self.adapter()
+        send = adapter.send_prompt
+
+        def observe_send(*args, **kwargs):
+            self.assertEqual(self.backend.closed, 0)
+            journal = w.read_json(self.root / "ledger" / "created-sessions" / (REQUEST + ".json"))
+            self.assertEqual(journal["state"], "created")
+            self.assertFalse(journal["workerFinished"])
+            result = send(*args, **kwargs)
+            self.assertEqual(self.backend.closed, 0)
+            return result
+
+        with patch.object(adapter, "send_prompt", side_effect=observe_send):
+            result = adapter.create_session(self.params, self.events.append)
+        self.assertEqual(result["replyText"], "Done.")
+        self.assertEqual(self.backend.closed, 1)
+        journal = w.read_json(self.root / "ledger" / "created-sessions" / (REQUEST + ".json"))
+        self.assertTrue(journal["workerFinished"])
+
+    def test_creation_connection_closes_after_uncertain_first_delivery(self):
+        self.config["allowCreateSessions"] = True
+        self.core.receipt.update(state="delivery_uncertain_no_retry", accepted=False,
+                                 persisted=False, reply_complete=False, completion_status=None)
+        adapter = self.adapter()
+        send = adapter.send_prompt
+
+        def observe_send(*args, **kwargs):
+            self.assertEqual(self.backend.closed, 0)
+            return send(*args, **kwargs)
+
+        with patch.object(adapter, "send_prompt", side_effect=observe_send):
+            error = self.assert_error("delivery_unresolved", lambda: adapter.create_session(self.params, self.events.append))
+        self.assertTrue(error["deliveryUncertain"])
+        self.assertTrue(error["promptSubmitted"])
+        self.assertEqual(self.backend.closed, 1)
+        receipt = w.read_json(self.root / "ledger" / (REQUEST + ".json"))
+        self.assertEqual(receipt["state"], "delivery_uncertain_no_retry")
+        self.assertTrue(receipt["attempted"])
+        journal = w.read_json(self.root / "ledger" / "created-sessions" / (REQUEST + ".json"))
+        self.assertEqual(journal["threadId"], NEW_THREAD)
+        self.assertTrue(journal["workerFinished"])
+
+    def test_creation_journal_write_failure_closes_connection_without_start(self):
+        self.config["allowCreateSessions"] = True
+        with patch.object(self.core._transport, "atomic_json", side_effect=OSError("disk unavailable")):
+            with self.assertRaises(OSError):
+                self.adapter().create_session(self.params, self.events.append)
+        self.assertEqual(self.backend.closed, 1)
+        self.assertFalse(any(method == "thread/start" for method, _ in self.backend.calls))
+        self.assertFalse(self.core.send_calls)
 
     def test_lost_creation_response_is_durable_and_never_duplicates(self):
         self.config["allowCreateSessions"] = True
@@ -309,12 +445,14 @@ class WorkerTests(unittest.TestCase):
         self.assert_error("creation_requires_review", lambda: adapter.create_session(self.params, self.events.append))
         self.assertEqual(sum(method == "thread/start" for method, _ in self.backend.calls), 1)
         self.assertFalse(self.core.send_calls)
+        self.assertEqual(self.backend.closed, 1)
 
     def test_new_settings_mismatch_never_submits_prompt(self):
         self.config["allowCreateSessions"] = True
         self.backend.wrong_permissions = True
         self.assert_error("new_session_settings_mismatch", lambda: self.adapter().create_session(self.params, self.events.append))
         self.assertFalse(self.core.send_calls)
+        self.assertEqual(self.backend.closed, 1)
 
     def test_lost_name_response_never_submits_prompt_or_recreates(self):
         self.config["allowCreateSessions"] = True
@@ -430,6 +568,7 @@ class InstalledCoreTests(unittest.TestCase):
         self.core = w.load_module(gateway_root, "gateway_core.py", "_test_installed_core")
         with patch.dict(sys.modules, {"gateway_core": self.core}):
             fixture = w.load_module(gateway_root, "test_gateway_core.py", "_test_installed_fixture")
+        self.fixture = fixture
         self.backend = fixture.Backend(self.root / "ledger")
         self.config = {"gatewayRoot": gateway_root, "bindingManifest": str(self.root / "manifest.json"),
             "ledgerDir": str(self.root / "ledger"), "sender": {"kind": "whatsapp", "id": "whatsapp-owner"},
@@ -441,6 +580,245 @@ class InstalledCoreTests(unittest.TestCase):
         self.adapter = w.Adapter(self.config, core=self.core, runtime=Runtime(self.binding),
                                  binding=self.binding, rpc_factory=self.backend.factory)
         self.params = {"requestId": REQUEST, "threadId": fixture.DEST["thread_id"], "workspace": fixture.DEST["cwd"], "prompt": "Reply harmlessly."}
+
+    def require_bearer_transport(self):
+        if "bearer_token" not in inspect.signature(self.core._transport.WebSocket).parameters:
+            self.skipTest("installed transport does not yet support bearer authentication")
+        return self.core._transport
+
+    def test_websocket_bearer_and_unauthenticated_upgrade_headers(self):
+        transport = self.require_bearer_transport()
+        for token in (None, "A" * 64):
+            with self.subTest(authenticated=token is not None):
+                socket = HandshakeSocket()
+                with patch.object(transport.socket, "create_connection", return_value=socket):
+                    websocket = transport.WebSocket("ws://127.0.0.1:4500", bearer_token=token)
+                    request = socket.sent[0].decode("ascii")
+                    self.assertEqual(request.count("Authorization:"), int(token is not None))
+                    if token is not None:
+                        self.assertIn("\r\nAuthorization: Bearer " + token + "\r\n", request)
+                    websocket.close()
+                    self.assertTrue(socket.closed)
+
+    def test_websocket_invalid_bearer_refuses_before_socket_without_value(self):
+        transport = self.require_bearer_transport()
+        for token in ("", "A" * 63, "A" * 65, "A" * 64 + "\r\nInjected: yes", "A" * 63 + "=", b"A" * 64):
+            with self.subTest(length=len(token)):
+                with patch.object(transport.socket, "create_connection") as connect:
+                    with self.assertRaises(transport.ProbeError) as caught:
+                        transport.WebSocket("ws://127.0.0.1:4500", bearer_token=token)
+                    connect.assert_not_called()
+                    self.assertNotIn("A" * 63, str(caught.exception))
+
+    def test_websocket_unauthorized_response_never_exposes_echoed_token(self):
+        transport = self.require_bearer_transport()
+        token = "B" * 64
+        socket = HandshakeSocket(b"HTTP/1.1 401 Unauthorized\r\nX-Echo: " + token.encode("ascii") + b"\r\n\r\n")
+        output = io.StringIO()
+        with patch.object(transport.socket, "create_connection", return_value=socket), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            with self.assertRaises(transport.ProbeError) as caught:
+                transport.WebSocket("ws://127.0.0.1:4500", bearer_token=token)
+        self.assertNotIn(token, str(caught.exception) + output.getvalue())
+        self.assertTrue(socket.closed)
+
+    def enable_new_paginated_thread(self):
+        if not hasattr(self.core.Gateway, "send_created"):
+            self.skipTest("installed core does not yet support creation handoff")
+        self.config["allowCreateSessions"] = self.adapter.config["allowCreateSessions"] = True
+        self.params.update(threadName="New phone task", permissionLevel="read-only", model="chosen-model")
+        self.creation_connections = []
+        self.creation_responses = []
+        self.after_create = lambda: None
+        self.history_always_missing = False
+        base_factory = self.backend.factory
+        fixture = self.fixture
+
+        def factory(endpoint):
+            rpc = base_factory(endpoint)
+            rpc.closed = False
+            base_request = rpc.request
+
+            def close():
+                self.assertFalse(rpc.closed, "connection closed more than once")
+                rpc.closed = True
+
+            def request(method, params):
+                self.assertFalse(rpc.closed, "closed creation connection reused")
+                if method == "thread/start":
+                    rpc.next_id += 1
+                    self.backend.calls.append((method, copy.deepcopy(params)))
+                    self.creation_connections.append(rpc)
+                    fixture.DEST.update(thread_id=NEW_THREAD, title=self.params["threadName"])
+                    self.backend.thread.update(id=NEW_THREAD, name=None, model=params["model"],
+                        historyMode="paginated", preview="", ephemeral=False, turns=[], status={"type": "idle"})
+                    sandbox = {"read-only": "readOnly", "workspace-write": "workspaceWrite"}[params["sandbox"]]
+                    result = {"thread": copy.deepcopy(self.backend.thread), "cwd": params["cwd"],
+                        "model": params["model"], "reasoningEffort": "medium",
+                        "approvalPolicy": params["approvalPolicy"], "sandbox": {"type": sandbox}}
+                    self.creation_responses.append(result)
+                    self.after_create()
+                    return result
+                if method == "thread/name/set":
+                    rpc.next_id += 1
+                    self.backend.calls.append((method, copy.deepcopy(params)))
+                    self.backend.thread["name"] = params["name"]
+                    return {}
+                if (method == "thread/turns/list" or method == "thread/read" and params.get("includeTurns")):
+                    if not self.backend.turns or self.history_always_missing:
+                        self.backend.calls.append((method, copy.deepcopy(params)))
+                        raise self.core._transport.RpcError(-32600)
+                if method == "turn/start":
+                    self.assertIs(rpc, self.creation_connections[0], "first turn opened a different RPC")
+                    self.assertFalse(rpc.closed)
+                result = base_request(method, params)
+                if method == "thread/resume":
+                    result["sandbox"] = {"type": "readOnly"}
+                return result
+
+            rpc.request = request
+            rpc.close = close
+            return rpc
+
+        self.adapter.rpc_factory = lambda endpoint: w.CancellableRpc(factory(endpoint), self.adapter)
+
+    def test_first_paginated_turn_uses_creation_connection_and_preserves_read_only(self):
+        self.enable_new_paginated_thread()
+        result = self.adapter.create_session(self.params, lambda _: None)
+        self.assertEqual(result["replyText"], "Verified harmless reply.")
+        mutations = [(m, p) for m, p in self.backend.calls if m in ("thread/resume", "turn/start", "turn/steer")]
+        self.assertEqual([m for m, _ in mutations], ["turn/start"])
+        self.assertEqual(set(mutations[0][1]), {"threadId", "input"})
+        methods = [m for m, _ in self.backend.calls]
+        self.assertLess(methods.index("turn/start"), methods.index("thread/turns/list"))
+        receipt = w.read_json(self.root / "ledger" / (REQUEST + ".json"))
+        self.assertTrue(receipt["persisted"] and receipt["reply_complete"] and receipt["no_setting_overrides"])
+        self.assertEqual(receipt["subscription"]["state"], "original_creation_connection")
+        self.assertEqual(self.creation_responses[0]["sandbox"], {"type": "readOnly"})
+        self.assertTrue(self.creation_connections[0].closed)
+        self.assertEqual(list((self.root / "ledger").rglob("*.lock")), [])
+
+    def test_first_turn_refuses_concurrent_activity_or_unload(self):
+        self.enable_new_paginated_thread()
+        self.after_create = lambda: self.backend.active()
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertEqual(caught.exception.error["code"], "created_thread_changed")
+        self.assertFalse(caught.exception.error["promptSubmitted"])
+        self.assertFalse(any(m in ("turn/start", "turn/steer", "thread/resume") for m, _ in self.backend.calls))
+        self.assertTrue(self.creation_connections[0].closed)
+
+    def test_first_turn_refuses_unloaded_creation_without_resuming(self):
+        self.enable_new_paginated_thread()
+        def unloaded():
+            self.backend.loaded = False
+            self.backend.thread["status"] = {"type": "notLoaded"}
+        self.after_create = unloaded
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertEqual(caught.exception.error["code"], "created_thread_changed")
+        self.assertFalse(any(m in ("turn/start", "thread/resume") for m, _ in self.backend.calls))
+
+    def test_first_turn_refuses_changed_runtime(self):
+        self.enable_new_paginated_thread()
+        original = self.binding.verify
+        def changed():
+            self.binding.verify = lambda thread_id: {**original(thread_id), "runtime_id": "different-runtime"}
+        self.after_create = changed
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertEqual(caught.exception.error["code"], "owner_admission_failed")
+        self.assertFalse(any(m == "turn/start" for m, _ in self.backend.calls))
+
+    def test_first_turn_refuses_changed_model(self):
+        self.enable_new_paginated_thread()
+        self.after_create = lambda: self.backend.thread.update(model="different-model")
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertEqual(caught.exception.error["code"], "creation_settings_unverified")
+        self.assertFalse(any(m == "turn/start" for m, _ in self.backend.calls))
+
+    def test_first_turn_lost_response_reconciles_without_a_second_send(self):
+        self.enable_new_paginated_thread()
+        self.backend.disconnect_send = True
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertTrue(caught.exception.error["deliveryUncertain"])
+        self.assertTrue(caught.exception.error["promptSubmitted"])
+        status = self.adapter.reconcile_request({"requestId": REQUEST})
+        self.assertTrue(status["persisted"])
+        self.assertFalse(status["completed"])
+        self.assertEqual(sum(m == "turn/start" for m, _ in self.backend.calls), 1)
+        self.assertTrue(self.creation_connections[0].closed)
+        self.assertEqual(list((self.root / "ledger").rglob("*.lock")), [])
+
+    def test_first_turn_completed_request_replay_does_not_create_or_send_again(self):
+        self.enable_new_paginated_thread()
+        first = self.adapter.create_session(self.params, lambda _: None)
+        second = self.adapter.create_session(self.params, lambda _: None)
+        self.assertEqual(second["replyText"], first["replyText"])
+        self.assertEqual(len(self.creation_connections), 1)
+        self.assertEqual(sum(m == "turn/start" for m, _ in self.backend.calls), 1)
+
+    def test_first_turn_observer_disconnect_releases_locks_without_interrupt(self):
+        self.enable_new_paginated_thread()
+        cancelled = threading.Event()
+        self.adapter.cancel_event = cancelled
+        def cancel_when_observing():
+            self.creation_connections[0].pump = lambda _timeout: cancelled.set()
+        self.after_create = cancel_when_observing
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertTrue(caught.exception.error["promptSubmitted"])
+        self.assertEqual(list((self.root / "ledger").rglob("*.lock")), [])
+        self.assertTrue(self.creation_connections[0].closed)
+        self.assertFalse(any(m == "turn/interrupt" for m, _ in self.backend.calls))
+        cancelled.clear()
+        self.assertTrue(self.adapter.reconcile_request({"requestId": REQUEST})["persisted"])
+        self.assertEqual(sum(m == "turn/start" for m, _ in self.backend.calls), 1)
+
+    def test_first_turn_does_not_report_reply_without_persisted_history(self):
+        self.enable_new_paginated_thread()
+        self.history_always_missing = True
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertTrue(caught.exception.error["promptSubmitted"])
+        receipt = w.read_json(self.root / "ledger" / (REQUEST + ".json"))
+        self.assertFalse(receipt["persisted"] or receipt["reply_complete"])
+        self.assertEqual(sum(m == "turn/start" for m, _ in self.backend.calls), 1)
+
+    def test_first_turn_handoff_rejects_copied_response_and_reuse(self):
+        self.enable_new_paginated_thread()
+        send = self.adapter.send_prompt
+        captured = {}
+        def inspect_handoff(params, emit, *, destination, _creation):
+            rpc, response, proof = _creation
+            gateway = self.adapter.gateway([destination])
+            options = {"rpc": rpc, "creation_response": response, "creation_proof": proof,
+                       "workflow": self.config["workflow"], "timeout": 0}
+            args = (REQUEST, "local", NEW_THREAD, self.params["prompt"], self.config["sender"])
+            with self.assertRaises(self.core.GatewayError) as copied:
+                gateway.send_created(*args, **{**options, "creation_response": copy.deepcopy(response)})
+            self.assertEqual(copied.exception.code, "creation_handoff_invalid")
+            result = send(params, emit, destination=destination, _creation=_creation)
+            with self.assertRaises(self.core.GatewayError) as reused:
+                gateway.send_created(*args, **options)
+            self.assertEqual(reused.exception.code, "creation_handoff_invalid")
+            captured["checked"] = True
+            return result
+        with patch.object(self.adapter, "send_prompt", side_effect=inspect_handoff):
+            self.adapter.create_session(self.params, lambda _: None)
+        self.assertTrue(captured["checked"])
+        self.assertEqual(sum(m == "turn/start" for m, _ in self.backend.calls), 1)
+
+    def test_existing_missing_history_still_refuses_even_with_caller_fresh_flags(self):
+        self.enable_new_paginated_thread()
+        self.backend.thread["historyMode"] = "paginated"
+        with self.assertRaises(w.WorkerError) as caught:
+            self.adapter.send_prompt({**self.params, "fresh": True, "creation_response": {}}, lambda _: None)
+        self.assertFalse(caught.exception.error["promptSubmitted"])
+        self.assertEqual(caught.exception.error["code"], "rpc_rejected")
+        self.assertFalse(any(m in ("thread/start", "thread/resume", "turn/start", "turn/steer") for m, _ in self.backend.calls))
 
     def test_real_core_idle_delivery_and_duplicate_request_reconciliation(self):
         result = self.adapter.send_prompt(self.params, lambda _: None)

@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Experimental Windows desktop-owned bridge candidate: the desktop launches its native backend through a stdio broker, with authenticated loopback access for the gateway. Native tool and approval requests remain with the desktop. Staging does not activate or restart Codex.
+- Exact process ancestry, executable/source fingerprints and fresh connection checks for this bridge. A private capability token can be supplied to the gateway worker without entering request logs.
+
+### Fixed
+
+- Retain a newly created gateway conversation's connection through its first prompt. When the installed gateway supports the dedicated first-turn handoff, use its original creation response instead of querying history that does not exist yet. Older gateway cores refuse creation before starting a conversation.
+- Describe an unsuccessful ownership check accurately without claiming the desktop disconnected when the observation itself was too slow.
+
+### Documentation
+
+- Record observed shared-gateway activation blockers: missing desktop app-tools bootstrap context and a new paginated conversation's missing source rollout before its first prompt. Socket ownership alone does not establish desktop tool compatibility or successful messaging.
+
 ## [0.8.0] - 2026-10-14
 
 ### Added

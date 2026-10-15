@@ -8,6 +8,7 @@ Only standard-library Python is required. One process handles one request.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import importlib.util
 import json
 import ntpath
@@ -82,6 +83,8 @@ def validate_config(value):
     config = dict(value)
     for key in ("gatewayRoot", "bindingManifest", "ledgerDir"):
         absolute_path(config.get(key), key)
+    if "transportTokenFile" in config:
+        absolute_path(config["transportTokenFile"], "transportTokenFile")
     for key in ("allowSelectedSessions", "allowCreateSessions"):
         if key in config and type(config[key]) is not bool:
             raise WorkerError("invalid_config", key + " must be boolean.")
@@ -115,6 +118,20 @@ def validate_config(value):
     return config
 
 
+def read_transport_token(config):
+    path = config.get("transportTokenFile")
+    if path is None:
+        return None
+    try:
+        with Path(path).open("rb") as stream:
+            raw = stream.read(68)
+    except OSError:
+        raise WorkerError("transport_token_unavailable", "The private transport token file could not be read; no connection opened.") from None
+    if re.fullmatch(rb"[A-Za-z0-9_-]{64}(?:\r?\n)?", raw) is None:
+        raise WorkerError("invalid_transport_token", "The private transport token must contain exactly 64 base64url characters and an optional final newline; value suppressed.")
+    return raw[:64].decode("ascii")
+
+
 class CancellableRpc:
     """Cooperative observer cancellation; close and receipt cleanup remain usable."""
     def __init__(self, rpc, adapter):
@@ -140,7 +157,12 @@ class CancellableRpc:
         if method in ("turn/start", "turn/steer"):
             self._adapter.prompt_attempted = True
         # Let the core record a returned mutation response before checking again.
-        return self._rpc.request(method, params, *args, **kwargs)
+        response = self._rpc.request(method, params, *args, **kwargs)
+        if method == "thread/start":
+            # In-memory identity proves the first-turn handoff came from this
+            # connection's successful creation, never caller JSON or a journal.
+            object.__setattr__(self, "_gateway_creation_response", response)
+        return response
 
     def pump(self, timeout):
         self._adapter.check_cancelled()
@@ -155,6 +177,7 @@ class Adapter:
         self.cancel_event = cancel_event
         self.mutation_attempted = self.creation_attempted = self.prompt_attempted = False
         self.config = validate_config(config)
+        transport_token = read_transport_token(self.config)
         root = self.config["gatewayRoot"]
         self.core = core or load_module(root, "gateway_core.py", "_whatsapp_gateway_core")
         self.runtime = runtime or load_module(root, "gateway_runtime.py", "_whatsapp_gateway_runtime")
@@ -175,7 +198,17 @@ class Adapter:
         self.host = self.config["host"]
         if binding.manifest.get("host") != self.host:
             raise WorkerError("identity_mismatch", "Configured host differs from the runtime binding manifest.")
-        factory = rpc_factory or (lambda endpoint: self.core._transport.Rpc(self.core._transport.WebSocket(endpoint)))
+        def default_factory(endpoint):
+            # Keep the original call shape for existing unauthenticated local
+            # transports. The secret is never part of config, RPC or receipts.
+            kwargs = {} if transport_token is None else {"bearer_token": transport_token}
+            try:
+                websocket = self.core._transport.WebSocket(endpoint, **kwargs)
+            except TypeError:
+                raise WorkerError("gateway_transport_upgrade_required", "The configured gateway transport does not support this authentication option; details suppressed.") from None
+            return self.core._transport.Rpc(websocket)
+
+        factory = rpc_factory or default_factory
         self.rpc_factory = lambda endpoint: CancellableRpc(factory(endpoint), self)
         self.destinations = self.config["destinations"]
         for destination in self.destinations:
@@ -210,7 +243,7 @@ class Adapter:
             proof = self.runtime.verify_binding(self.binding.manifest,
                 self.binding.snapshot_provider(self.binding.manifest), **kwargs)
         except self.runtime.RuntimeAdmissionError:
-            raise WorkerError("owner_admission_failed", "The configured desktop is not connected to its verified gateway backend.") from None
+            raise WorkerError("owner_admission_failed", "A fresh ownership check could not verify the configured desktop and gateway backend.") from None
         if proof.get("verified") is not True or proof.get("host") != self.host or proof.get("endpoint") != self.endpoint:
             raise WorkerError("owner_admission_failed", "Runtime ownership proof does not match the selected host.")
         return proof
@@ -334,7 +367,7 @@ class Adapter:
                 "sender": self.config["sender"], "workflow": self.config["workflow"]})
             return destination
 
-    def send_prompt(self, params, emit, *, destination=None):
+    def send_prompt(self, params, emit, *, destination=None, _creation=None):
         request_id = self.request_id(params)
         prompt = params.get("prompt")
         self.core.public_text(prompt)
@@ -353,9 +386,17 @@ class Adapter:
                       "status": value.get("status")})
 
         deadline = time.monotonic() + self.config["observationTimeoutSeconds"]
-        receipt = gateway.send(request_id, self.host, destination["thread_id"], prompt,
+        send = gateway.send
+        handoff = {}
+        if _creation is not None:
+            send = getattr(gateway, "send_created", None)
+            if not callable(send):
+                raise WorkerError("first_turn_unsupported", "The installed gateway core does not support verified first-turn handoff.")
+            rpc, response, proof = _creation
+            handoff = {"rpc": rpc, "creation_response": response, "creation_proof": proof}
+        receipt = send(request_id, self.host, destination["thread_id"], prompt,
             self.config["sender"], workflow=self.config["workflow"],
-            timeout=min(5, max(0, deadline - time.monotonic())), on_event=event)
+            timeout=min(5, max(0, deadline - time.monotonic())), on_event=event, **handoff)
         while True:
             if receipt.get("turn_id") and receipt["turn_id"] != emitted_turn:
                 event({"turn_id": receipt["turn_id"]})
@@ -381,7 +422,10 @@ class Adapter:
         # A competing status/retry must never label another live worker finished.
         with self.core.FileLock(path.parent, "worker-" + request_id):
             try:
-                return self._create_session(params, emit)
+                # The first turn uses this exact creation connection. Keep its
+                # subscription alive through observation and any later handoff.
+                with ExitStack() as creation_connections:
+                    return self._create_session(params, emit, creation_connections)
             finally:
                 if path.is_file():
                     journal = read_json(path)
@@ -390,7 +434,7 @@ class Adapter:
                     journal["promptAttemptedByWorker"] = self.prompt_attempted
                     self.core._transport.atomic_json(path, journal)
 
-    def _create_session(self, params, emit):
+    def _create_session(self, params, emit, creation_connections):
         self.check_cancelled()
         if not self.config.get("allowCreateSessions"):
             raise WorkerError("creation_not_allowed", "New native sessions are disabled in this gateway's trusted configuration.")
@@ -415,6 +459,7 @@ class Adapter:
         digest = self.core.fingerprint(identity)
         directory = Path(self.config["ledgerDir"]) / "created-sessions"
         path = directory / (request_id + ".json")
+        creation = None
         with self.core.FileLock(directory, request_id):
             if path.exists():
                 journal = read_json(path)
@@ -429,7 +474,12 @@ class Adapter:
                 journal["workerFinished"] = False
                 self.core._transport.atomic_json(path, journal)
             else:
+                if (Path(self.config["ledgerDir"]) / (request_id + ".json")).exists():
+                    raise WorkerError("request_id_collision", "This request ID already has a delivery receipt; no new session will be created.")
+                if not callable(getattr(self.gateway([]), "send_created", None)):
+                    raise WorkerError("first_turn_unsupported", "Install a gateway core with verified first-turn handoff before creating new sessions.")
                 rpc, proof = self.connect()
+                creation_connections.callback(rpc.close)
                 journal = {"schema": "codex-whatsapp-creation-v1", "requestId": request_id,
                            "requestSha256": digest, "state": "creation_attempted_outcome_uncertain",
                            "runtimeId": proof["runtime_id"], "promptSubmitted": False, "workerFinished": False}
@@ -440,62 +490,61 @@ class Adapter:
                 # Persist before the mutation. A missing response must never cause another creation.
                 self.core._transport.atomic_json(path, journal)
                 try:
-                    try:
-                        response = rpc.request("thread/start", start_params)
-                    except WorkerError:
-                        if not self.creation_attempted:
-                            journal["state"] = "cancelled_before_creation"
-                            self.core._transport.atomic_json(path, journal)
-                        raise
-                    except self.core._transport.RpcError as exc:
-                        if self.core.definitive_rpc_rejection(exc):
-                            journal["state"] = "rejected"
-                            self.core._transport.atomic_json(path, journal)
-                        raise WorkerError("creation_rejected" if journal["state"] == "rejected" else "creation_uncertain",
-                            "The backend did not confirm new-session creation. Inspect the creation journal before trying again.",
-                            uncertain=journal["state"] != "rejected", requestId=request_id, stage=journal["state"]) from None
-                    except Exception:
-                        raise WorkerError("creation_uncertain", "The new-session response was lost. Do not retry with a new request ID; a session may already exist.",
-                            uncertain=True, requestId=request_id, stage=journal["state"]) from None
-                    thread = response.get("thread", {})
-                    journal["threadId"] = thread.get("id")
-                    journal["state"] = "created_unverified"
-                    self.core._transport.atomic_json(path, journal)
-                    if (not isinstance(thread.get("id"), str) or not thread["id"] or
-                            canonical_workspace(thread.get("cwd")) != canonical_workspace(workspace) or
-                            canonical_workspace(response.get("cwd")) != canonical_workspace(workspace) or
-                            response.get("approvalPolicy") != policies[permission][0] or
-                            response.get("sandbox", {}).get("type") != policies[permission][1] or
-                            (model is not None and response.get("model") != model)):
-                        raise WorkerError("new_session_settings_mismatch", "The new session's returned identity or permissions differ from the request. No prompt was sent.",
-                            requestId=request_id, stage=journal["state"])
-                    # Only this newly returned session may be named. Never rename a selected existing task.
-                    journal["state"] = "naming_attempted_outcome_uncertain"
-                    self.core._transport.atomic_json(path, journal)
-                    try:
-                        rpc.request("thread/name/set", {"threadId": thread["id"], "name": name})
-                        current = rpc.request("thread/read", {"threadId": thread["id"], "includeTurns": False})["thread"]
-                    except Exception:
-                        raise WorkerError("creation_naming_uncertain", "The new session exists, but its name could not be verified. No prompt was sent; inspect the creation journal.",
-                            uncertain=True, requestId=request_id, stage=journal["state"]) from None
-                    if (current.get("id"), current.get("name"), current.get("cwd")) != (thread["id"], name, thread["cwd"]):
-                        raise WorkerError("identity_mismatch", "The newly created session changed before delivery. No prompt was sent.", requestId=request_id)
-                    destination = {"host": self.host, "thread_id": thread["id"], "title": name,
-                        "cwd": thread["cwd"], "endpoint": self.endpoint,
-                        "allowed_senders": [self.config["sender"]["id"]], "allowed_workflows": [self.config["workflow"]]}
-                    # A baseline records what this creation returned; it never widens a later policy.
-                    effort = response.get("reasoningEffort")
-                    if effort is not None:
-                        destination["settings_baseline"] = {"threadId": thread["id"], "settings": {
-                            "model": response.get("model"), "effort": effort, "cwd": thread["cwd"],
-                            "approvalPolicy": response["approvalPolicy"], "sandboxType": permission}}
-                    self.gateway([destination])
-                    journal.update({"state": "created", "destination": destination})
-                    self.core._transport.atomic_json(path, journal)
-                finally:
-                    rpc.close()
+                    response = rpc.request("thread/start", start_params)
+                except WorkerError:
+                    if not self.creation_attempted:
+                        journal["state"] = "cancelled_before_creation"
+                        self.core._transport.atomic_json(path, journal)
+                    raise
+                except self.core._transport.RpcError as exc:
+                    if self.core.definitive_rpc_rejection(exc):
+                        journal["state"] = "rejected"
+                        self.core._transport.atomic_json(path, journal)
+                    raise WorkerError("creation_rejected" if journal["state"] == "rejected" else "creation_uncertain",
+                        "The backend did not confirm new-session creation. Inspect the creation journal before trying again.",
+                        uncertain=journal["state"] != "rejected", requestId=request_id, stage=journal["state"]) from None
+                except Exception:
+                    raise WorkerError("creation_uncertain", "The new-session response was lost. Do not retry with a new request ID; a session may already exist.",
+                        uncertain=True, requestId=request_id, stage=journal["state"]) from None
+                thread = response.get("thread", {})
+                journal["threadId"] = thread.get("id")
+                journal["state"] = "created_unverified"
+                self.core._transport.atomic_json(path, journal)
+                if (not isinstance(thread.get("id"), str) or not thread["id"] or
+                        canonical_workspace(thread.get("cwd")) != canonical_workspace(workspace) or
+                        canonical_workspace(response.get("cwd")) != canonical_workspace(workspace) or
+                        response.get("approvalPolicy") != policies[permission][0] or
+                        response.get("sandbox", {}).get("type") != policies[permission][1] or
+                        (model is not None and response.get("model") != model)):
+                    raise WorkerError("new_session_settings_mismatch", "The new session's returned identity or permissions differ from the request. No prompt was sent.",
+                        requestId=request_id, stage=journal["state"])
+                # Only this newly returned session may be named. Never rename a selected existing task.
+                journal["state"] = "naming_attempted_outcome_uncertain"
+                self.core._transport.atomic_json(path, journal)
+                try:
+                    rpc.request("thread/name/set", {"threadId": thread["id"], "name": name})
+                    current = rpc.request("thread/read", {"threadId": thread["id"], "includeTurns": False})["thread"]
+                except Exception:
+                    raise WorkerError("creation_naming_uncertain", "The new session exists, but its name could not be verified. No prompt was sent; inspect the creation journal.",
+                        uncertain=True, requestId=request_id, stage=journal["state"]) from None
+                if (current.get("id"), current.get("name"), current.get("cwd")) != (thread["id"], name, thread["cwd"]):
+                    raise WorkerError("identity_mismatch", "The newly created session changed before delivery. No prompt was sent.", requestId=request_id)
+                destination = {"host": self.host, "thread_id": thread["id"], "title": name,
+                    "cwd": thread["cwd"], "endpoint": self.endpoint,
+                    "allowed_senders": [self.config["sender"]["id"]], "allowed_workflows": [self.config["workflow"]]}
+                # A baseline records what this creation returned; it never widens a later policy.
+                effort = response.get("reasoningEffort")
+                if effort is not None:
+                    destination["settings_baseline"] = {"threadId": thread["id"], "settings": {
+                        "model": response.get("model"), "effort": effort, "cwd": thread["cwd"],
+                        "approvalPolicy": response["approvalPolicy"], "sandboxType": permission}}
+                self.gateway([destination])
+                journal.update({"state": "created", "destination": destination})
+                self.core._transport.atomic_json(path, journal)
+                creation = (rpc, response, proof)
         self.check_cancelled()
-        return self.send_prompt({**params, "threadId": destination["thread_id"]}, emit, destination=destination)
+        return self.send_prompt({**params, "threadId": destination["thread_id"]}, emit,
+                                destination=destination, _creation=creation)
 
     def raise_receipt_error(self, receipt):
         state = receipt.get("state", "unknown")

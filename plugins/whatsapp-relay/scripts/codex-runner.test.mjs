@@ -15,6 +15,12 @@ import {
   classifyProjectIntent
 } from "./codex-runner.mjs";
 
+// These protocol fixtures start real Node child processes and use temporary
+// files; the pagination test starts two app servers. Under the concurrent full
+// suite, Windows process startup alone can exceed five seconds. Keep a bounded
+// whole-test budget without changing production RPC or interruption deadlines.
+const MOCK_CODEX_TEST_TIMEOUT_MS = 30_000;
+
 async function makeMockCodex(t) {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "relay-codex-test-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }));
@@ -89,7 +95,7 @@ async function makeMockCodex(t) {
   return { workspace, codexBin };
 }
 
-test("native Codex listing inherits the user's context and completes the app-server handshake", { timeout: 5000 }, async (t) => {
+test("native Codex listing inherits the user's context and completes the app-server handshake", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   const [thread] = await listCodexThreads({ ...fixture });
   const preview = JSON.parse(thread.preview);
@@ -108,7 +114,7 @@ test("native session discovery refuses an unscoped relative workspace", async ()
   await assert.rejects(listCodexThreads({ workspace: "relative-directory" }), /absolute workspace/);
 });
 
-test("native host discovery omits cwd filtering, follows pages and preserves actual directory and status", { timeout: 5000 }, async t => {
+test("native host discovery omits cwd filtering, follows pages and preserves actual directory and status", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async t => {
   const fixture = await makeMockCodex(t);
   const other = path.join(fixture.workspace, "another-project");
   await fs.writeFile(path.join(fixture.workspace, "mock-threads.json"), JSON.stringify({
@@ -133,7 +139,7 @@ test("native host discovery omits cwd filtering, follows pages and preserves act
   assert.deepEqual(scoped.map(row => row.id), ["older"]);
 });
 
-test("native host discovery caps results at 200", { timeout: 5000 }, async t => {
+test("native host discovery caps results at 200", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async t => {
   const fixture = await makeMockCodex(t);
   const rows = Array.from({ length: 205 }, (_, index) => ({ id: `native-${index}`, cwd: fixture.workspace, updatedAt: 1000 - index }));
   await fs.writeFile(path.join(fixture.workspace, "mock-threads.json"), JSON.stringify({
@@ -143,7 +149,7 @@ test("native host discovery caps results at 200", { timeout: 5000 }, async t => 
   assert.equal((await listCodexThreads({ ...fixture, scope: "host", limit: 1000 })).length, 200);
 });
 
-test("native session discovery rejects invalid scopes and pagination loops", { timeout: 5000 }, async t => {
+test("native session discovery rejects invalid scopes and pagination loops", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async t => {
   const fixture = await makeMockCodex(t);
   await assert.rejects(listCodexThreads({ ...fixture, scope: "global-typo" }), /scope/);
   await fs.writeFile(path.join(fixture.workspace, "mock-threads.json"), JSON.stringify({
@@ -152,7 +158,7 @@ test("native session discovery rejects invalid scopes and pagination loops", { t
   await assert.rejects(listCodexThreads({ ...fixture, scope: "host" }), /repeated cursor/);
 });
 
-test("native resume forwards approvals and returns lifecycle events and Unicode reply", { timeout: 5000 }, async (t) => {
+test("native resume forwards approvals and returns lifecycle events and Unicode reply", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   const approvals = [];
   const events = [];
@@ -173,21 +179,21 @@ test("native resume forwards approvals and returns lifecycle events and Unicode 
   assert.ok(events.some((event) => event.type === "turnCompleted"));
 });
 
-test("coalesced turn/start response and completion cannot lose the first native events", { timeout: 5000 }, async (t) => {
+test("coalesced turn/start response and completion cannot lose the first native events", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   const run = startCodexTurn({ ...fixture, prompt: "coalesced" });
   t.after(() => run.child.kill());
   assert.deepEqual(await run.resultPromise, { threadId: "native-thread", replyText: "Immediate reply" });
 });
 
-test("resume rejects a thread that app-server reports as active", { timeout: 5000 }, async (t) => {
+test("resume rejects a thread that app-server reports as active", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   const run = startCodexTurn({ ...fixture, threadId: "busy-thread", prompt: "Do not start" });
   t.after(() => run.child.kill());
   await assert.rejects(run.resultPromise, /already running/);
 });
 
-test("an ownership rejection during resume is definitely unsubmitted and never calls turn/start or retries", { timeout: 5000 }, async (t) => {
+test("an ownership rejection during resume is definitely unsubmitted and never calls turn/start or retries", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   const events = [];
   const run = startCodexTurn({ ...fixture, threadId: "owned-thread", prompt: "Do not replay", onLifecycleEvent: (event) => events.push(event) });
@@ -208,7 +214,7 @@ test("an ownership rejection during resume is definitely unsubmitted and never c
   assert.ok(!events.some((event) => event.type === "turnStarted"));
 });
 
-test("an identical writer error from turn/start is not classified as a pre-submission resume failure", { timeout: 5000 }, async (t) => {
+test("an identical writer error from turn/start is not classified as a pre-submission resume failure", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   const run = startCodexTurn({ ...fixture, threadId: "existing", prompt: "writer-during-start" });
   t.after(() => run.child.kill());
@@ -220,7 +226,7 @@ test("an identical writer error from turn/start is not classified as a pre-submi
   });
 });
 
-test("native interrupt targets the selected thread and turn", { timeout: 5000 }, async (t) => {
+test("native interrupt targets the selected thread and turn", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   let run;
   let resolveStarted;
@@ -235,7 +241,7 @@ test("native interrupt targets the selected thread and turn", { timeout: 5000 },
   assert.ok(events.some((event) => event.type === "turnCompleted" && event.status === "interrupted"));
 });
 
-test("classification uses the configured local host executable", { timeout: 5000 }, async (t) => {
+test("classification uses the configured local host executable", { timeout: MOCK_CODEX_TEST_TIMEOUT_MS }, async (t) => {
   const fixture = await makeMockCodex(t);
   const result = await classifyProjectIntent({ workspace: fixture.workspace, codexBin: "deliberately-missing", host: { id: "host", transport: "local", codexBin: fixture.codexBin }, intent: "main", projects: [{ alias: "main" }] });
   assert.equal(result.projectAlias, "main");
