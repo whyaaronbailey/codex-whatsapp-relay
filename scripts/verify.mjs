@@ -11,7 +11,9 @@ const files = ["plugins/whatsapp-relay/scripts", "scripts"].flatMap((directory) 
     .map((file) => path.join(root, directory, file))
 ).sort();
 if (mode === "test") {
-  const result = spawnSync(process.execPath, ["--test", ...files], { cwd: root, stdio: "inherit", windowsHide: true });
+  // Many files spawn protocol fixtures of their own. Bound file concurrency so
+  // process-start contention does not consume their intentionally short timers.
+  const result = spawnSync(process.execPath, ["--test", "--test-concurrency=2", ...files], { cwd: root, stdio: "inherit", windowsHide: true });
   if (result.error) throw result.error;
   process.exitCode = result.status ?? 1;
 } else {
