@@ -161,12 +161,16 @@ function Hash-Text([string]$value) {
   finally { $hash.Dispose() }
 }
 $filter = ($spec.pids | ForEach-Object { 'ProcessId = ' + [string][int]$_ }) -join ' OR '
+Import-Module Microsoft.PowerShell.Utility,CimCmdlets,NetTCPIP -ErrorAction Stop
+# Startup and module loading observe no ownership evidence. Start the freshness
+# window immediately before the first observation, not before spawning the child.
+$started = [DateTime]::UtcNow.ToString('o')
 $all = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop)
 $processes=@($all | ForEach-Object { [ordered]@{pid=[int]$_.ProcessId;parent=[int]$_.ParentProcessId;path=$_.ExecutablePath;created=$_.CreationDate.ToUniversalTime().ToString('o');commandLineSha256=(Hash-Text $_.CommandLine)} })
 $connections=@(Get-NetTCPConnection -LocalPort ([int]$spec.port) -State Listen -ErrorAction Stop | ForEach-Object {[ordered]@{pid=[int]$_.OwningProcess;state=$_.State.ToString();local_address=$_.LocalAddress;local_port=[int]$_.LocalPort}})
 $files=@{}
 foreach($file in $spec.files) { $files[$file]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() }
-[ordered]@{computer=$env:COMPUTERNAME;processes=$processes;connections=$connections;files=$files} | ConvertTo-Json -Depth 8 -Compress
+[ordered]@{computer=$env:COMPUTERNAME;started_utc=$started;processes=$processes;connections=$connections;files=$files} | ConvertTo-Json -Depth 8 -Compress
 """
 
 
@@ -174,7 +178,6 @@ def windows_snapshot(manifest, *, expected_computer='KAMPUTER', expected_host='l
     if os.name != 'nt':
         raise RuntimeAdmissionError('Windows ownership observation is required.')
     port = validate_manifest(manifest, socket.gethostname(), expected_computer=expected_computer, expected_host=expected_host)
-    started = utc_now()
     spec = {'pids': [manifest[r]['pid'] for r in ROLES], 'port': port,
             'files': list(dict.fromkeys(manifest[r]['path'] for r in (*ROLES, 'script', 'config')))}
     # PowerShell 7 or a caller's custom modules must not select incompatible
@@ -192,6 +195,10 @@ def windows_snapshot(manifest, *, expected_computer='KAMPUTER', expected_host='l
         if result.returncode:
             raise RuntimeAdmissionError('Windows ownership observation failed; stderr suppressed.')
         snapshot = json.loads(result.stdout.lstrip('\ufeff'))
+        # This marker precedes every process, listener and full-file hash read.
+        # Preserve it through the health request; verify_binding still enforces
+        # the same five-second limit across all observations and delivery.
+        timestamp_ticks(snapshot.get('started_utc'))
         snapshot['files'] = {canonical(k): v for k, v in snapshot['files'].items()}
         challenge = secrets.token_hex(16)
         connection = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
@@ -204,7 +211,7 @@ def windows_snapshot(manifest, *, expected_computer='KAMPUTER', expected_host='l
             health = json.loads(body)
         finally:
             connection.close()
-        snapshot.update(started_utc=started, observed_utc=utc_now(), challenge=challenge, health=health)
+        snapshot.update(observed_utc=utc_now(), challenge=challenge, health=health)
         return snapshot
     except RuntimeAdmissionError:
         raise

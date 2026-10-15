@@ -151,15 +151,22 @@ class RuntimeTests(unittest.TestCase):
 class SnapshotCollectionTests(unittest.TestCase):
     setUp = RuntimeTests.setUp
 
-    def collect(self, *, returncode=0):
+    def collect(self, *, returncode=0, startup_clock=None):
         result = SimpleNamespace(returncode=returncode, stdout=json.dumps(self.snapshot))
+        clock = [startup_clock or self.now]
+
+        def child_finished(*args, **kwargs):
+            clock[0] = self.now
+            return result
+
         connection = mock.Mock()
         connection.getresponse.return_value = SimpleNamespace(
             status=200, read=lambda limit: json.dumps(self.snapshot['health']).encode())
         with (mock.patch.object(r.os, 'name', 'nt'),
               mock.patch.object(r.socket, 'gethostname', return_value='KAMPUTER'),
               mock.patch.object(r.subprocess, 'CREATE_NO_WINDOW', 0, create=True),
-              mock.patch.object(r.subprocess, 'run', return_value=result) as run,
+              mock.patch.object(r.subprocess, 'run', side_effect=child_finished) as run,
+              mock.patch.object(r, 'utc_now', side_effect=lambda: clock[0]),
               mock.patch.object(r.http.client, 'HTTPConnection', return_value=connection),
               mock.patch.object(r.secrets, 'token_hex', return_value='b' * 32)):
             snapshot = r.windows_snapshot(self.manifest)
@@ -187,6 +194,40 @@ class SnapshotCollectionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}, clear=True):
             with self.assertRaises(r.RuntimeAdmissionError):
                 self.collect(returncode=1)
+
+    def test_cold_start_excluded_but_child_evidence_timestamp_preserved(self):
+        with mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}, clear=True):
+            snapshot, _, _ = self.collect(startup_clock='2026-10-15T02:59:50Z')
+        self.assertEqual(snapshot['started_utc'], self.snapshot['started_utc'])
+        self.assertEqual(snapshot['observed_utc'], self.now)
+        self.assertTrue(r.verify_binding(self.manifest, snapshot, computer='KAMPUTER', now=self.now)['verified'])
+
+    def test_module_loading_precedes_every_ownership_observation(self):
+        start = r.SNAPSHOT_PS.index("$started = [DateTime]::UtcNow.ToString('o')")
+        self.assertLess(r.SNAPSHOT_PS.index('Import-Module '), start)
+        for observation in ['Get-CimInstance ', 'Get-NetTCPConnection ', 'Get-FileHash ']:
+            self.assertLess(start, r.SNAPSHOT_PS.index(observation))
+
+    def test_slow_observations_and_health_delivery_still_rejected(self):
+        self.now = '2026-10-15T03:00:07Z'
+        with mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}, clear=True):
+            snapshot, _, connection = self.collect()
+        connection.close.assert_called_once()
+        with self.assertRaises(r.RuntimeAdmissionError):
+            r.verify_binding(self.manifest, snapshot, computer='KAMPUTER', now=self.now)
+
+    def test_missing_child_evidence_marker_fails_closed(self):
+        del self.snapshot['started_utc']
+        with mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}, clear=True):
+            with self.assertRaises(r.RuntimeAdmissionError):
+                self.collect()
+
+    def test_future_child_evidence_marker_fails_closed(self):
+        self.snapshot['started_utc'] = '2026-10-15T03:00:05Z'
+        with mock.patch.dict(os.environ, {'SystemRoot': r'C:\Windows'}, clear=True):
+            snapshot, _, _ = self.collect()
+        with self.assertRaises(r.RuntimeAdmissionError):
+            r.verify_binding(self.manifest, snapshot, computer='KAMPUTER', now=self.now)
 
 
 if __name__ == '__main__':
