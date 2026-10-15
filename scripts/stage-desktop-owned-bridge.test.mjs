@@ -35,7 +35,7 @@ test("staged native shim preserves argv, stdin and opaque environment without ac
   const direct = await run(manifest.executable, [fixture, ...args], { cwd: dir, env, input: "hello stdin 😀" });
   assert.equal(direct.code, 0, direct.stderr);
   const directResult = JSON.parse(direct.stdout);
-  assert.deepEqual({ ...directResult, cwd: fs.realpathSync(directResult.cwd) }, { args, input: "hello stdin 😀", opaque: "opaque-fixture", cwd: fs.realpathSync(dir) });
+  assert.deepEqual({ ...directResult, cwd: fs.realpathSync.native(directResult.cwd) }, { args, input: "hello stdin 😀", opaque: "opaque-fixture", cwd: fs.realpathSync.native(dir) });
   const nativeArgs = ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled", "-c", 'custom="value with spaces"'];
   const intercepted = await run(manifest.executable, nativeArgs, { cwd: dir, env, input: "desktop-frame\n" });
   assert.equal(intercepted.code, 0, intercepted.stderr);
