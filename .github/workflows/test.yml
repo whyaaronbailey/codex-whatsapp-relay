@@ -28,3 +28,6 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: python -B plugins/whatsapp-relay/scripts/test_codex_gateway_worker.py -v
+      - run: python -B scripts/test_desktop_owned_launch.py -v
+      - run: python -B plugins/whatsapp-relay/scripts/test_desktop_bridge_runtime.py -v
+      - run: python -B plugins/whatsapp-relay/scripts/test_capture_desktop_bridge_binding.py -v

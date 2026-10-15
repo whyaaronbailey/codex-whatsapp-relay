@@ -3,8 +3,8 @@
 Default execution only checks pins. --probe invokes a harmless package-context
 access probe. --arm --wait observes normal Quit; it never closes an application.
 Every launch attempt has durable exclusive reservations and is never retried.
-The old manager must be disabled separately. An optional old-backend gate checks
-the exact listener and public loaded-thread list after the old desktop drains;
+The old manager must be disabled separately. An optional old-backend gate tracks
+its exact descendants and checks the listener and public loaded-thread list;
 operators must also prevent other clients from admitting new work to that server.
 """
 from __future__ import annotations
@@ -188,15 +188,20 @@ def validate_config(config, *, source_path=None, computer=None):
 
 class QuitTracker:
     """Tracks exact observed old-process instances, never just PID/name matches."""
-    def __init__(self, old):
+    def __init__(self, old, *, retained_root=False):
         self.old = identity(old)
         self.tracked = {old["pid"]: dict(old)}
         self.retired = set()
+        self.retired_at = {}
         self.started = False
+        self.retained_root = retained_root
+        self.remaining = 0
 
     def observe(self, snapshot):
         if not isinstance(snapshot, dict):
             fail("invalid_process_snapshot")
+        if self.retained_root and not same(snapshot.get(self.old["pid"]), self.old):
+            fail("old_backend_identity_changed")
         if not self.started and not same(snapshot.get(self.old["pid"]), self.old):
             fail("old_desktop_not_exactly_present")
         self.started = True
@@ -208,6 +213,7 @@ class QuitTracker:
                     # A proven newer incarnation establishes that the old one
                     # exited. Never treat the replacement as the old process.
                     self.retired.add(pid)
+                    self.retired_at.setdefault(pid, replacement["createdTicks"])
                 else:
                     fail("tracked_process_replaced_or_unreadable")
             elif pid in self.retired and pid in snapshot:
@@ -217,7 +223,15 @@ class QuitTracker:
             changed = False
             for pid, process in snapshot.items():
                 parent_id = process.get("ppid")
-                if parent_id not in self.tracked or parent_id in self.retired:
+                if parent_id not in self.tracked:
+                    continue
+                if parent_id in self.retired:
+                    if self.retained_root and pid not in self.tracked:
+                        # A later PID incarnation cannot have produced an older
+                        # child. Preserve this cutoff even after it exits.
+                        if (not process.get("path") or type(process.get("createdTicks")) is not int
+                                or process["createdTicks"] < self.retired_at[parent_id]):
+                            fail("historical_backend_parentage_ambiguous")
                     continue
                 if pid in self.tracked:
                     if pid in self.retired and same(snapshot.get(parent_id), self.tracked[parent_id]):
@@ -231,11 +245,52 @@ class QuitTracker:
                     fail("descendant_identity_ambiguous")
                 self.tracked[pid] = {key: process[key] for key in ("pid", "createdTicks", "path")}
                 changed = True
-        desktop_name = Path(self.old["path"]).name.casefold()
-        for pid, process in snapshot.items():
-            if process.get("name", "").casefold() == desktop_name and (pid not in self.tracked or pid in self.retired):
-                fail("another_desktop_observed")
-        return not any(pid in snapshot and pid not in self.retired for pid in self.tracked)
+        if not self.retained_root:
+            desktop_name = Path(self.old["path"]).name.casefold()
+            for pid, process in snapshot.items():
+                if process.get("name", "").casefold() == desktop_name and (pid not in self.tracked or pid in self.retired):
+                    fail("another_desktop_observed")
+        self.remaining = sum(pid in snapshot and pid not in self.retired
+                             and not (self.retained_root and pid == self.old["pid"]) for pid in self.tracked)
+        return self.remaining == 0
+
+    def checkpoint(self):
+        return {"tracked": list(self.tracked.values()), "retiredPids": sorted(self.retired),
+                "retiredAtTicks": {str(pid): self.retired_at[pid] for pid in sorted(self.retired)}}
+
+
+def backend_tracker(config, state=None):
+    if "oldBackend" not in config:
+        if state is not None:
+            fail("unexpected_old_backend_tracking")
+        return None
+    tracker = QuitTracker(config["oldBackend"]["server"], retained_root=True)
+    if state is not None:
+        if (not isinstance(state, dict) or set(state) != {"tracked", "retiredPids", "retiredAtTicks"}
+                or not isinstance(state["tracked"], list) or not isinstance(state["retiredPids"], list)
+                or not isinstance(state["retiredAtTicks"], dict)):
+            fail("invalid_old_backend_tracking")
+        values = [identity(item) for item in state["tracked"]]
+        tracked = {item["pid"]: dict(item) for item in values}
+        retired = state["retiredPids"]
+        cutoffs = state["retiredAtTicks"]
+        if (len(tracked) != len(values) or not same(tracked.get(tracker.old["pid"]), tracker.old)
+                or any(type(pid) is not int or pid not in tracked or pid == tracker.old["pid"] for pid in retired)
+                or len(set(retired)) != len(retired) or set(cutoffs) != {str(pid) for pid in retired}
+                or any(type(cutoffs[str(pid)]) is not int or cutoffs[str(pid)] <= tracked[pid]["createdTicks"] for pid in retired)):
+            fail("invalid_old_backend_tracking")
+        tracker.tracked, tracker.retired, tracker.started = tracked, set(retired), True
+        tracker.retired_at = {pid: cutoffs[str(pid)] for pid in retired}
+    return tracker
+
+
+def waiter_tree_gate(tracker, backend):
+    if os.getpid() in tracker.tracked:
+        fail("waiter_is_inside_old_desktop_tree")
+    if backend and os.getpid() in backend.tracked:
+        fail("waiter_is_inside_old_backend_tree")
+    if backend and (backend.old["pid"] in tracker.tracked or tracker.old["pid"] in backend.tracked):
+        fail("old_desktop_and_backend_trees_overlap")
 
 
 def manager_gate(config, snapshot):
@@ -248,8 +303,13 @@ def manager_gate(config, snapshot):
         fail("old_backend_admission_acknowledgment_required")
 
 
-def final_process_gate(config, tracked, snapshot):
+def final_process_gate(config, tracked, snapshot, *, backend=None):
     manager_gate(config, snapshot)
+    if "oldBackend" in config:
+        if backend is None:
+            fail("old_backend_tracking_required")
+        if not backend.observe(snapshot):
+            fail("old_backend_descendants_still_present")
     for item in tracked:
         actual = snapshot.get(item["pid"])
         if actual and (not actual.get("path") or type(actual.get("createdTicks")) is not int
@@ -260,15 +320,18 @@ def final_process_gate(config, tracked, snapshot):
         fail("another_desktop_observed")
 
 
-def old_backend_count(config, runtime):
+def old_backend_count(config, runtime, *, tracker=None):
     backend = config.get("oldBackend")
     if not backend:
         return 0
     server = backend["server"]
     port = urlsplit(backend["endpoint"]).port
     def verify():
-        if not same(runtime.snapshot().get(server["pid"]), server):
+        snapshot = runtime.snapshot()
+        if not same(snapshot.get(server["pid"]), server):
             fail("old_backend_identity_changed")
+        if tracker:
+            tracker.observe(snapshot)
         if runtime.listener_owners(port) != {server["pid"]}:
             fail("old_backend_listener_mismatch")
     verify()
@@ -284,8 +347,8 @@ def old_backend_count(config, runtime):
     return count
 
 
-def old_backend_empty(config, runtime):
-    return old_backend_count(config, runtime) == 0
+def old_backend_empty(config, runtime, *, tracker=None):
+    return old_backend_count(config, runtime, tracker=tracker) == 0
 
 
 class WindowsRuntime:
@@ -468,13 +531,21 @@ def result_path(request_path):
     return Path(request_path).with_name("result.json")
 
 
-def invoke_once(config, config_path, role, tracked, runtime, *, sleep=time.sleep, clock=time.monotonic):
+def invoke_once(config, config_path, role, tracked, runtime, *, backend_state=None, sleep=time.sleep, clock=time.monotonic):
+    if role == "launch" and "oldBackend" in config:
+        if backend_state is None:
+            fail("old_backend_tracking_required")
+        backend_tracker(config, backend_state)
+    elif backend_state is not None:
+        fail("unexpected_old_backend_tracking")
     directory = Path(config["stateDir"]) / ("launch" if role == "launch" else "probe-" + uuid.uuid4().hex)
     directory.mkdir(parents=True, exist_ok=False)
     request_path = directory / "request.json"
     request = {"schema": "codex-desktop-owned-launch-request-v1", "requestId": uuid.uuid4().hex,
                "configPath": str(Path(config_path).resolve()), "configSha256": sha(config_path),
                "role": role, "tracked": tracked, "createdAt": utc()}
+    if backend_state is not None:
+        request["backendTracking"] = backend_state
     exclusive(request_path, request)
     # Request existence is the durable reservation for this cmdlet attempt.
     try:
@@ -511,57 +582,71 @@ def invoke_once(config, config_path, role, tracked, runtime, *, sleep=time.sleep
 def arm_and_wait(config, config_path, runtime, *, sleep=time.sleep, clock=time.monotonic):
     validate_config(config, computer=os.environ.get("COMPUTERNAME", ""))
     tracker = QuitTracker(config["oldDesktop"])
+    backend = backend_tracker(config)
     snapshot = runtime.snapshot()
     manager_gate(config, snapshot)
     tracker.observe(snapshot)
-    if os.getpid() in tracker.tracked:
-        fail("waiter_is_inside_old_desktop_tree")
+    if backend:
+        backend.observe(snapshot)
+    waiter_tree_gate(tracker, backend)
     directory = Path(config["stateDir"])
     directory.mkdir(parents=True, exist_ok=True)
     reservation = {"schema": SCHEMA, "configSha256": sha(config_path), "armedAt": utc(),
                    "automaticRetry": False, "initialTracked": list(tracker.tracked.values())}
+    if backend:
+        reservation["initialBackendTracking"] = backend.checkpoint()
     try:
         exclusive(directory / "arm-reservation.json", reservation)
     except FileExistsError:
         fail("already_armed_no_retry", uncertain=True)
     deadline = clock() + config.get("waitSeconds", 3600)
     idle_deadline = None
+    def tracking_fields():
+        return {"tracked": list(tracker.tracked.values()),
+                **({"backendTracking": backend.checkpoint()} if backend else {})}
     try:
         while clock() < (idle_deadline if idle_deadline is not None else deadline):
             snapshot = runtime.snapshot()
             manager_gate(config, snapshot)
             drained = tracker.observe(snapshot)
+            if backend:
+                backend.observe(snapshot)
+            waiter_tree_gate(tracker, backend)
             if not drained:
-                wait_status(directory, "waiting_for_normal_quit", remainingOldProcesses=sum(same(snapshot.get(pid), item) for pid, item in tracker.tracked.items()))
+                wait_status(directory, "waiting_for_normal_quit", remainingOldProcesses=tracker.remaining, **tracking_fields())
                 sleep(config.get("pollSeconds", 5))
                 continue
             if "oldBackend" in config and idle_deadline is None:
                 # Native unloaded-thread retirement may take thirty minutes.
                 # This separate, >=45-minute budget begins only after Quit.
                 idle_deadline = clock() + config.get("oldBackendWaitSeconds", 3600)
-            remaining = old_backend_count(config, runtime)
+            remaining = old_backend_count(config, runtime, tracker=backend)
             if remaining == 0:
                 validate_config(config, computer=os.environ.get("COMPUTERNAME", ""))
-                final_process_gate(config, list(tracker.tracked.values()), runtime.snapshot())
-                wait_status(directory, "package_launch_attempt_reserved")
-                result = invoke_once(config, config_path, "launch", list(tracker.tracked.values()), runtime, sleep=sleep, clock=clock)
-                wait_status(directory, "desktop_launch_reported", desktop=result["desktop"])
-                return result
+                snapshot = runtime.snapshot()
+                if backend is None or backend.observe(snapshot):
+                    final_process_gate(config, list(tracker.tracked.values()), snapshot, backend=backend)
+                    wait_status(directory, "package_launch_attempt_reserved", **tracking_fields())
+                    result = invoke_once(config, config_path, "launch", list(tracker.tracked.values()), runtime,
+                                         backend_state=backend.checkpoint() if backend else None, sleep=sleep, clock=clock)
+                    wait_status(directory, "desktop_launch_reported", desktop=result["desktop"], **tracking_fields())
+                    return result
             wait_status(directory, "waiting_for_old_backend_idle", remainingLoadedThreads=remaining,
-                        idleSecondsRemaining=max(0, round(idle_deadline - clock(), 1)))
+                        remainingBackendDescendants=backend.remaining if backend else 0,
+                        idleSecondsRemaining=max(0, round(idle_deadline - clock(), 1)), **tracking_fields())
             sleep(config.get("pollSeconds", 5))
         fail("old_backend_idle_deadline_no_launch" if idle_deadline is not None else "wait_deadline_no_launch")
     except Exception as error:
-        wait_status(directory, "blocked", code=getattr(error, "code", "wait_failed"), uncertain=getattr(error, "uncertain", False))
+        wait_status(directory, "blocked", code=getattr(error, "code", "wait_failed"), uncertain=getattr(error, "uncertain", False), **tracking_fields())
         publish(directory / "wait-outcome.json", {"status": "stopped", "code": getattr(error, "code", "wait_failed"),
-                "uncertain": getattr(error, "uncertain", False), "automaticRetry": False, "recordedAt": utc()})
+                "uncertain": getattr(error, "uncertain", False), "automaticRetry": False, "recordedAt": utc(), **tracking_fields()})
         raise
 
 
 def run_wrapper(request_path, runtime=None):
     request_path = Path(request_path).resolve()
     request = load(request_path)
-    if (set(request) != {"schema", "requestId", "configPath", "configSha256", "role", "tracked", "createdAt"}
+    if (set(request) - {"backendTracking"} != {"schema", "requestId", "configPath", "configSha256", "role", "tracked", "createdAt"}
             or request.get("schema") != "codex-desktop-owned-launch-request-v1"
             or request.get("role") not in ("probe", "launch") or not re.fullmatch(r"[a-f0-9]{32}", request.get("requestId", ""))):
         fail("invalid_wrapper_request")
@@ -577,10 +662,23 @@ def run_wrapper(request_path, runtime=None):
         fail("invalid_tracked_processes")
     for item in request["tracked"]:
         identity(item)
+    needs_backend = request["role"] == "launch" and "oldBackend" in config
+    if needs_backend != ("backendTracking" in request):
+        fail("old_backend_tracking_required" if needs_backend else "unexpected_old_backend_tracking")
+    if needs_backend and request["backendTracking"] is None:
+        fail("invalid_old_backend_tracking")
+    backend = backend_tracker(config, request["backendTracking"]) if needs_backend else None
     if request["role"] == "launch":
         reservation = load(Path(config["stateDir"]) / "arm-reservation.json")
         if reservation.get("configSha256") != request["configSha256"] or not any(same(item, config["oldDesktop"]) for item in request["tracked"]):
             fail("arm_reservation_mismatch")
+        if backend:
+            initial = reservation.get("initialBackendTracking")
+            if initial is None:
+                fail("initial_old_backend_tracking_required")
+            initial_backend = backend_tracker(config, initial)
+            if any(not same(backend.tracked.get(pid), item) for pid, item in initial_backend.tracked.items()):
+                fail("initial_old_backend_tracking_missing")
     if result_path(request_path).exists():
         fail("wrapper_already_completed", uncertain=True)
     try:
@@ -600,11 +698,11 @@ def run_wrapper(request_path, runtime=None):
                 or result.get("executeAccess") is not True or result.get("accessHandleClosed") is not True):
             fail("package_access_proof_mismatch")
         if request["role"] == "launch":
-            final_process_gate(config, request["tracked"], runtime.snapshot())
-            if not old_backend_empty(config, runtime):
+            final_process_gate(config, request["tracked"], runtime.snapshot(), backend=backend)
+            if not old_backend_empty(config, runtime, tracker=backend):
                 fail("old_backend_has_loaded_threads")
             validate_config(config, computer=os.environ.get("COMPUTERNAME", ""))
-            final_process_gate(config, request["tracked"], runtime.snapshot())
+            final_process_gate(config, request["tracked"], runtime.snapshot(), backend=backend)
             exclusive(request_path.with_name("desktop-launch-reservation.json"), {"requestId": request["requestId"],
                       "configSha256": request["configSha256"], "outcome": "uncertain_until_result", "automaticRetry": False, "reservedAt": utc()})
             result["launchReserved"] = True
@@ -613,6 +711,8 @@ def run_wrapper(request_path, runtime=None):
         result["status"] = "success"
     except Exception as error:
         result["error"] = {"code": getattr(error, "code", "wrapper_operation_failed"), "type": type(error).__name__}
+    if backend:
+        result["backendTracking"] = backend.checkpoint()
     publish(result_path(request_path), result)
     return result
 

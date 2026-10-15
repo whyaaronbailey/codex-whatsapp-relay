@@ -316,6 +316,191 @@ class Tests(unittest.TestCase):
                 with self.assertRaises(launch.LaunchError): launch.old_backend_empty(self.config, runtime)
                 self.assertEqual(runtime.launches, [])
 
+    def test_backend_descendants_and_orphan_grandchild_must_naturally_drain(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        grandchild = process(57, 70, self.files["real-cli.exe"], 56)
+        runtime = MockRuntime(self.config, [{10: self.old, 55: self.backend, 56: child, 57: grandchild}])
+        statuses = []
+        def advance(seconds):
+            self.assertEqual(runtime.invocations, [])
+            statuses.append(launch.load(Path(self.config["stateDir"]) / "wait-status.json"))
+            runtime.last = {55: self.backend, 57: grandchild} if len(statuses) == 1 else {55: self.backend}
+            self.clock.sleep(seconds)
+        result = launch.arm_and_wait(self.config, self.config_path, runtime, sleep=advance, clock=self.clock)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(runtime.launches), 1)
+        self.assertEqual(statuses[1]["remainingLoadedThreads"], 0)
+        self.assertEqual(statuses[1]["remainingBackendDescendants"], 1)
+        request = launch.load(runtime.invocations[0])
+        self.assertEqual({item["pid"] for item in request["backendTracking"]["tracked"]}, {55, 56, 57})
+        self.assertEqual(runtime.last, {55: self.backend})  # Retained root was never terminated.
+
+    def test_backend_must_be_exactly_alive_at_arm_and_never_retired(self):
+        self.old_backend()
+        for snapshot in ({10: self.old}, {10: self.old, 55: {**self.backend, "createdTicks": 999}}):
+            with self.assertRaisesRegex(launch.LaunchError, "old_backend_identity_changed"):
+                self.arm(MockRuntime(self.config, [snapshot]))
+        self.assertFalse(Path(self.config["stateDir"]).exists())
+        tracker = launch.backend_tracker(self.config)
+        self.assertTrue(tracker.observe({55: self.backend}))
+        with self.assertRaisesRegex(launch.LaunchError, "old_backend_identity_changed"):
+            tracker.observe({55: {**self.backend, "createdTicks": 999}})
+        self.assertEqual(tracker.retired, set())
+
+    def test_waiter_inside_either_old_tree_refuses_before_arm(self):
+        self.old_backend()
+        for parent, code in ((10, "old_desktop_tree"), (55, "old_backend_tree")):
+            waiter = process(91, 150, self.files["pythonw.exe"], parent)
+            with self.subTest(parent=parent), patch.object(launch.os, "getpid", return_value=91):
+                with self.assertRaisesRegex(launch.LaunchError, code):
+                    self.arm(MockRuntime(self.config, [{10: self.old, 55: self.backend, 91: waiter}]))
+        self.assertFalse(Path(self.config["stateDir"]).exists())
+
+    def test_overlapping_retained_backend_and_desktop_trees_refuse(self):
+        self.old_backend()
+        desktop = {**self.old, "ppid": 55}
+        with self.assertRaisesRegex(launch.LaunchError, "trees_overlap"):
+            self.arm(MockRuntime(self.config, [{10: desktop, 55: self.backend}]))
+        self.assertFalse(Path(self.config["stateDir"]).exists())
+
+    def test_unknown_backend_orphan_after_parent_exit_is_ambiguous(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        orphan = process(57, 70, self.files["real-cli.exe"], 56)
+        tracker = launch.backend_tracker(self.config)
+        tracker.observe({55: self.backend, 56: child})
+        with self.assertRaisesRegex(launch.LaunchError, "unobserved_descendant_after_parent_exit"):
+            tracker.observe({55: self.backend, 57: orphan})
+
+    def test_backend_retirement_cutoff_survives_restore_and_later_reuse(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        known = process(57, 70, self.files["real-cli.exe"], 56)
+        replacement = process(56, 200, self.files["pythonw.exe"])
+        tracker = launch.backend_tracker(self.config)
+        tracker.observe({55: self.backend, 56: child, 57: known})
+        self.assertFalse(tracker.observe({55: self.backend, 56: replacement, 57: known}))
+        tracker = launch.backend_tracker(self.config, tracker.checkpoint())
+        newer_child = process(58, 210, self.files["node.exe"], 56)
+        self.assertFalse(tracker.observe({55: self.backend, 57: known, 58: newer_child}))
+        self.assertTrue(tracker.observe({55: self.backend, 58: newer_child}))
+        self.assertNotIn(58, tracker.tracked)
+        self.assertTrue(tracker.observe({55: self.backend, 56: {**replacement, "createdTicks": 300}, 58: newer_child}))
+        self.assertEqual(tracker.retired_at[56], 200)
+        for ambiguous in (process(59, 100, self.files["real-cli.exe"], 56), {"pid": 59, "ppid": 56, "name": "unknown.exe"}):
+            with self.assertRaisesRegex(launch.LaunchError, "historical_backend_parentage_ambiguous"):
+                tracker.observe({55: self.backend, 59: ambiguous})
+
+    def test_backend_checkpoint_rejects_duplicate_root_retirement_and_unknown_cutoff(self):
+        self.old_backend()
+        state = launch.backend_tracker(self.config).checkpoint()
+        invalid = [
+            {**state, "tracked": state["tracked"] * 2},
+            {**state, "retiredPids": [55], "retiredAtTicks": {"55": 200}},
+            {**state, "retiredAtTicks": {"99": 200}},
+            {"tracked": state["tracked"], "retiredPids": []},
+        ]
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(launch.LaunchError, "invalid_old_backend_tracking"):
+                launch.backend_tracker(self.config, value)
+
+    def test_new_backend_child_in_wrapper_blocks_before_launch_reservation(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        runtime = MockRuntime(self.config, [{10: self.old, 55: self.backend}, {55: self.backend}])
+        invoke = runtime.invoke_package
+        def race(config, request_path):
+            runtime.last = {55: self.backend, 56: child}
+            return invoke(config, request_path)
+        runtime.invoke_package = race
+        with self.assertRaisesRegex(launch.LaunchError, "package_wrapper_refused"):
+            self.arm(runtime)
+        self.assertEqual(runtime.launches, [])
+        result = launch.load(launch.result_path(runtime.invocations[0]))
+        self.assertEqual(result["error"]["code"], "old_backend_descendants_still_present")
+        self.assertEqual({item["pid"] for item in result["backendTracking"]["tracked"]}, {55, 56})
+        self.assertFalse(runtime.invocations[0].with_name("desktop-launch-reservation.json").exists())
+
+    def test_backend_child_during_loaded_query_or_final_snapshot_blocks(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        for at_snapshot in (3, 4):  # Post-query verification, then the last wrapper gate.
+            with self.subTest(at_snapshot=at_snapshot):
+                self.config["stateDir"] = str(self.root / ("race-" + str(at_snapshot))); self.save()
+                runtime = MockRuntime(self.config, [{10: self.old, 55: self.backend}, {55: self.backend}])
+                original_invoke = runtime.invoke_package
+                def race(config, request_path):
+                    observations = [0]
+                    def snapshot():
+                        observations[0] += 1
+                        return {55: self.backend, **({56: child} if observations[0] >= at_snapshot else {})}
+                    runtime.snapshot = snapshot
+                    return original_invoke(config, request_path)
+                runtime.invoke_package = race
+                with self.assertRaisesRegex(launch.LaunchError, "package_wrapper_refused"):
+                    self.arm(runtime)
+                self.assertEqual(runtime.launches, [])
+                self.assertFalse(runtime.invocations[0].with_name("desktop-launch-reservation.json").exists())
+
+    def test_backend_launch_requires_new_complete_tracking_evidence(self):
+        self.old_backend()
+        runtime = MockRuntime(self.config, [{55: self.backend}])
+        with self.assertRaisesRegex(launch.LaunchError, "old_backend_tracking_required"):
+            launch.invoke_once(self.config, self.config_path, "launch", [exact(self.old)], runtime)
+        self.assertFalse(Path(self.config["stateDir"]).exists())
+        directory = Path(self.config["stateDir"]) / "launch"; directory.mkdir(parents=True)
+        launch.exclusive(directory.parent / "arm-reservation.json", {"configSha256": launch.sha(self.config_path)})
+        request = {"schema": "codex-desktop-owned-launch-request-v1", "requestId": "a" * 32,
+                   "configPath": str(self.config_path), "configSha256": launch.sha(self.config_path),
+                   "role": "launch", "tracked": [exact(self.old)], "createdAt": launch.utc()}
+        request_path = directory / "request.json"
+        request_path.write_text(json.dumps(request))
+        with self.assertRaisesRegex(launch.LaunchError, "old_backend_tracking_required"):
+            launch.run_wrapper(request_path, runtime)
+        request["backendTracking"] = None
+        request_path.write_text(json.dumps(request))
+        with self.assertRaisesRegex(launch.LaunchError, "invalid_old_backend_tracking"):
+            launch.run_wrapper(request_path, runtime)
+        request["backendTracking"] = launch.backend_tracker(self.config).checkpoint()
+        request_path.write_text(json.dumps(request))
+        with self.assertRaisesRegex(launch.LaunchError, "initial_old_backend_tracking_required"):
+            launch.run_wrapper(request_path, runtime)
+        self.assertFalse(request_path.with_name("wrapper-reservation.json").exists())
+        self.assertEqual(runtime.launches, [])
+
+    def test_wrapper_cannot_drop_original_backend_descendant_identity(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        runtime = MockRuntime(self.config, [{10: self.old, 55: self.backend, 56: child}, {55: self.backend}])
+        invoke = runtime.invoke_package
+        caught = []
+        def drop(config, request_path):
+            request = launch.load(request_path)
+            request["backendTracking"]["tracked"] = [exact(self.backend)]
+            request_path.write_text(json.dumps(request))
+            try:
+                return invoke(config, request_path)
+            except launch.LaunchError as error:
+                caught.append(error.code)
+                raise
+        runtime.invoke_package = drop
+        with self.assertRaises(launch.LaunchError): self.arm(runtime)
+        self.assertEqual(caught, ["initial_old_backend_tracking_missing"])
+        self.assertEqual(runtime.launches, [])
+
+    def test_backend_timeout_persists_children_discovered_after_arm(self):
+        self.old_backend(); self.config["oldBackendWaitSeconds"] = 2700; self.config["pollSeconds"] = 30; self.save()
+        child = process(56, 60, self.files["node.exe"], 55)
+        runtime = MockRuntime(self.config, [{10: self.old, 55: self.backend}, {55: self.backend, 56: child}])
+        with self.assertRaisesRegex(launch.LaunchError, "old_backend_idle_deadline_no_launch"):
+            self.arm(runtime)
+        directory = Path(self.config["stateDir"])
+        self.assertEqual(len(launch.load(directory / "arm-reservation.json")["initialBackendTracking"]["tracked"]), 1)
+        for name in ("wait-status.json", "wait-outcome.json"):
+            self.assertEqual({item["pid"] for item in launch.load(directory / name)["backendTracking"]["tracked"]}, {55, 56})
+        self.assertEqual(runtime.invocations, [])
+
     def test_desktop_child_environment_only_changes_three_public_overrides(self):
         captured = {}
         class FakeProcess:

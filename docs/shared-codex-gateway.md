@@ -27,6 +27,10 @@ On 2026-10-15, the candidate passed live validation on a Windows VM with desktop
 
 The Windows verifier starts its five-second freshness window immediately before its first process observation, after PowerShell startup and built-in module loading. Process ancestry, listener ownership, full-file hashes and the live connection response all remain inside that window. A binding records exact live process identities: a later desktop restart requires a fresh verified capture. Do not update recorded process IDs by hand or replay a completed launch plan.
 
+When migrating from an independently running backend, first verify that other local Codex work has finished and close its automatic management and new-work admission. The launcher waits for a normal desktop Quit, an empty loaded-session list, and the natural exit of the old backend's tracked descendants, including helper backends outside the desktop's process tree. It retains the old backend itself and never terminates processes or deletes writer locks. Ambiguous process identities, newly observed descendants, or uncertain launch results prevent a new launch; they are not grounds for an automatic retry.
+
+Tracking begins when the launcher is armed. Before arming, reconcile every previously observed backend descendant and intermediate parent with fresh process evidence. A surviving process whose parent has already exited must not disappear from the review merely because its current ancestry no longer reaches the old backend. Leave activation unarmed whenever ownership or ongoing work is uncertain.
+
 The bridge worker configuration additionally requires `transportTokenFile`, an absolute local path to a private 64-character base64url capability. Generate it independently on each machine from 48 random bytes and restrict its Windows ACL to the user and SYSTEM. Do not send it through WhatsApp, copy it between machines, or commit it. The gateway transport must support authenticated WebSocket handshakes, and new-session delivery requires the upgraded gateway core's `send_created` method.
 
 ## Installation contract
