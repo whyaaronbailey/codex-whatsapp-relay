@@ -4,24 +4,28 @@ This experimental adapter lets the WhatsApp controller connect to the same Codex
 
 The default adapter continues to start its own app-server. Enable the shared adapter only after the gateway can prove that the desktop is connected to its loopback backend. A desktop using its ordinary private connection cannot be attached merely by enabling this setting. Switching that desktop to the gateway may require a one-time quit and relaunch after its current work finishes.
 
-### Current activation blockers
+### Findings from the v0.8.0 preview
 
 Live validation of the v0.8.0 preview found that a verified desktop WebSocket connection is insufficient for activation:
 
 - An independently launched backend can lose the desktop's app-tools bootstrap context. In the tested Windows installation, app-tools MCP failed because `CODEX_APP_TOOLS_PIPE_PATH` was absent, removing native chat and automation controls. Retaining startup feature flags did not preserve these tools. Repeatedly restarting the same launcher does not resolve the missing context.
 - Creating a new paginated-history conversation succeeded, but history inspection before its first prompt failed with `missing source rollout`. The prompt was not submitted. New-session delivery needs a validated first-turn flow; do not interpret that error as empty history for arbitrary existing conversations or automatically retry uncertain creation attempts.
 
-Shared activation remains on hold in that installation. Keep each route disabled until both native desktop tools and a complete message/reply test pass on that machine. The standard adapter can still work with conversations it owns; it cannot take over a conversation held by the desktop.
+Keep each route disabled until both native desktop tools and a complete message/reply test pass on that machine. The standard adapter can still work with conversations it owns; it cannot take over a conversation held by the desktop.
 
 ### Desktop-owned bridge candidate
 
-The development branch includes an alternative Windows transport under `scripts/stage-desktop-owned-bridge.mjs` and `plugins/whatsapp-relay/scripts/desktop-owned-bridge.mjs`. The desktop launches a small executable shim through its installed `CODEX_CLI_PATH` override. The shim delegates to the native backend using the desktop's original arguments and inherited environment. The broker passes the desktop's stdio traffic through and exposes a capability-protected loopback WebSocket for the gateway. It does not copy or reconstruct private desktop bootstrap values.
+The unreleased source includes an alternative Windows transport under `scripts/stage-desktop-owned-bridge.mjs` and `plugins/whatsapp-relay/scripts/desktop-owned-bridge.mjs`. The desktop launches a small executable shim through its installed `CODEX_CLI_PATH` override. The shim delegates to the native backend using the desktop's original arguments and inherited environment. The broker passes the desktop's stdio traffic through and exposes a capability-protected loopback WebSocket for the gateway. It does not copy or reconstruct private desktop bootstrap values.
 
 The desktop performs the native initialization and receives every server-originated tool or approval request. Gateway connections have a restricted method list, separate request IDs and bounded message queues. Closing a gateway connection does not cancel or replay a native turn. Normal desktop EOF closes the native stdin pipe; the bridge never force-stops the backend.
 
 Readiness requires a successful initialization reply delivered to the desktop, followed by either its `initialized` notification or a successful reply to a later desktop request. This accommodates desktop builds that omit the notification without inventing protocol messages. The health response exposes only handshake flags and the readiness basis; it does not include request contents, credentials or private desktop context. A ready connection still needs the tool and message validation described below.
 
 This is an experimental compatibility layer, not a confirmed native multi-client feature. The `CODEX_CLI_PATH` override and package/sandbox behavior require validation against the installed desktop version. Staging and offline tests do not establish native tool parity. Do not enable the route until the actual desktop-owned process chain, tools and message/reply round trip have passed validation on that machine.
+
+On 2026-10-15, the candidate passed live validation on a Windows VM with desktop version `26.1007.9446.0`: a new dedicated chat completed its first message, a second message completed in the same chat, and persisted native history confirmed a successful `codex_app/read_thread` call. The connection also exposed Hindsight recall metadata. These checks used the relay's SSH gateway path; they do not establish phone-originated WhatsApp delivery, every native tool's behavior, or compatibility with another desktop installation.
+
+The Windows verifier starts its five-second freshness window immediately before its first process observation, after PowerShell startup and built-in module loading. Process ancestry, listener ownership, full-file hashes and the live connection response all remain inside that window. A binding records exact live process identities: a later desktop restart requires a fresh verified capture. Do not update recorded process IDs by hand or replay a completed launch plan.
 
 The bridge worker configuration additionally requires `transportTokenFile`, an absolute local path to a private 64-character base64url capability. Generate it independently on each machine from 48 random bytes and restrict its Windows ACL to the user and SYSTEM. Do not send it through WhatsApp, copy it between machines, or commit it. The gateway transport must support authenticated WebSocket handshakes, and new-session delivery requires the upgraded gateway core's `send_created` method.
 
