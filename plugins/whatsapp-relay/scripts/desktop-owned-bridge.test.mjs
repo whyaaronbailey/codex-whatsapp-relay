@@ -26,12 +26,12 @@ function capture(stream) {
   stream.on("data", chunk => { data += chunk.toString("utf8"); let at; while ((at = data.indexOf("\n")) >= 0) { const line = data.slice(0, at); data = data.slice(at + 1); if (line) messages.push(JSON.parse(line)); } });
   return messages;
 }
-function mockBackend({ linger = false, respond } = {}) {
+function mockBackend({ linger = false, respond, respondInitialize } = {}) {
   const child = new EventEmitter(); Object.assign(child, { pid: 32123, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), killed: false });
   child.kill = () => { assert.fail("The bridge must never kill a process."); };
   const requests = capture(child.stdin);
   let chunk = "", closed = false;
-  child.stdin.on("data", data => { chunk += data.toString(); let i; while ((i = chunk.indexOf("\n")) >= 0) { const message = JSON.parse(chunk.slice(0, i)); chunk = chunk.slice(i + 1); if (message.method === "initialize") child.stdout.write(`${JSON.stringify({ id: message.id, result: { userAgent: "mock/1", platformFamily: "windows" } })}\n`); else respond?.(message, child); } });
+  child.stdin.on("data", data => { chunk += data.toString(); let i; while ((i = chunk.indexOf("\n")) >= 0) { const message = JSON.parse(chunk.slice(0, i)); chunk = chunk.slice(i + 1); if (message.method === "initialize") { if (respondInitialize) respondInitialize(message, child); else child.stdout.write(`${JSON.stringify({ id: message.id, result: { userAgent: "mock/1", platformFamily: "windows" } })}\n`); } else respond?.(message, child); } });
   child.finish = () => { if (closed) return; closed = true; child.stdout.end(); child.stderr.end(); setImmediate(() => child.emit("close", 0)); };
   child.stdin.once("finish", () => { if (!linger) child.finish(); });
   return { child, requests };
@@ -41,11 +41,11 @@ async function fixture(t, options = {}) {
   const config = { schema: BRIDGE_SCHEMA, realCliPath: process.execPath, nodePath: process.execPath,
     bridgePath: fileURLToPath(new URL("./desktop-owned-bridge.mjs", import.meta.url)), tokenFile: path.join(dir, "token"), statusFile: path.join(dir, "status.json"), port: await freePort(), shutdownGraceMs: 30, ...options.config };
   fs.writeFileSync(config.tokenFile, `${TOKEN}\n`);
-  const input = new PassThrough(), output = new PassThrough(), errors = new PassThrough();
+  const input = new PassThrough(), output = options.output ?? new PassThrough(), errors = new PassThrough();
   errors.resume(); const desktop = capture(output), backend = options.backend ?? mockBackend(options);
-  let spawns = 0, launch;
+  let spawns = 0, launch; const statuses = [];
   const bridge = await startDesktopBridge(config, options.nativeArgs ?? ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"], {
-    input, output, errors, env: options.env ?? process.env,
+    input, output, errors, env: options.env ?? process.env, onStatus: value => statuses.push(value),
     spawnImpl: (file, args, opts) => { spawns++; launch = { file, args, opts }; return options.spawnImpl ? options.spawnImpl(file, args, opts) : backend.child; }
   });
   const clients = [];
@@ -73,7 +73,7 @@ async function fixture(t, options = {}) {
     }
     return { ws, messages, send: message => ws.send(JSON.stringify(message)) };
   }
-  return { dir, config, input, output, desktop, backend, bridge, ready, connect, write, spawns: () => spawns, launch: () => launch };
+  return { dir, config, input, output, desktop, backend, bridge, ready, connect, write, statuses, spawns: () => spawns, launch: () => launch };
 }
 
 test("only normal desktop stdio launch is intercepted", () => {
@@ -97,9 +97,200 @@ test("initialization, environment and arguments stay desktop-owned; health leaks
   const health = await response.json();
   assert.equal(health.challenge, "a".repeat(32)); assert.equal(health.state, "ready");
   assert.equal(JSON.stringify(health).includes("opaque-fixture"), false);
-  assert.deepEqual(Object.keys(health).sort(), ["backendPid", "bridgePid", "challenge", "instanceId", "primaryReady", "schema", "state"].sort());
+  assert.deepEqual(Object.keys(health).sort(), ["backendPid", "bridgePid", "challenge", "instanceId", "primaryReady", "schema", "state", "initializeRequestSeen", "initializeRequestForwarded", "initializeResultSeen", "initializeReplyForwarded", "initializeErrorSeen", "initializeErrorForwarded", "initializedNotificationSeen", "postInitializePrimaryRequestSeen", "postInitializePrimarySuccessSeen", "readyBasis"].sort());
+  assert.equal(health.readyBasis, "initialized_notification");
   await assert.rejects(f.connect({ token: "wrong" }), /403/);
   await assert.rejects(f.connect({ origin: "https://untrusted.example" }), /403/);
+});
+
+const initializePrimary = f => f.write({ id: "desktop-init", method: "initialize", params: { clientInfo: { name: "actual-desktop" }, capabilities: { experimentalApi: true } } });
+const nativeReply = (f, request, fields) => f.backend.child.stdout.write(`${JSON.stringify({ id: request.id, ...fields })}\n`);
+function heldOutput(id) {
+  const output = new PassThrough(), original = output.write.bind(output), callbacks = [];
+  output.write = (bytes, callback) => {
+    if (JSON.parse(bytes.toString()).id !== id) return original(bytes, callback);
+    // Expose the bytes, but withhold successful write completion separately.
+    return original(bytes, error => error ? callback(error) : callbacks.push(callback));
+  };
+  return { output, callbacks, release: error => callbacks.shift()(error) };
+}
+
+test("desktop without initialized becomes ready only after a successful post-init RPC is forwarded", async t => {
+  const f = await fixture(t);
+  initializePrimary(f);
+  await eventually(() => f.bridge.health().initializeReplyForwarded);
+  assert.equal(f.bridge.health().primaryReady, false);
+  assert.equal(f.bridge.health().readyBasis, null);
+  await assert.rejects(f.connect(), /403/); // A secondary cannot drive readiness.
+  f.write({ id: "post-init", method: "account/read", params: {} });
+  await eventually(() => f.backend.requests.some(message => message.method === "account/read"));
+  assert.equal(f.bridge.health().postInitializePrimaryRequestSeen, true);
+  assert.equal(f.bridge.health().primaryReady, false);
+  nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { result: { fixture: "private-result-not-diagnostics" } });
+  await eventually(() => f.bridge.health().primaryReady);
+  const health = f.bridge.health();
+  assert.equal(health.readyBasis, "desktop_followup_response");
+  assert.equal(health.initializedNotificationSeen, false);
+  assert.equal(health.postInitializePrimarySuccessSeen, true);
+  assert.equal(JSON.stringify(health).includes("private-result-not-diagnostics"), false);
+  await f.connect();
+  assert.equal(f.backend.requests.filter(message => message.method === "initialize").length, 1);
+  assert.equal(f.backend.requests.some(message => message.method === "initialized"), false);
+  assert.equal(f.backend.requests.length, 2); // No synthetic handshake/probe.
+});
+
+test("a primary request admitted before init reply delivery cannot unlock readiness when its result arrives later", async t => {
+  const held = heldOutput("desktop-init"), f = await fixture(t, { output: held.output });
+  initializePrimary(f);
+  await eventually(() => held.callbacks.length === 1);
+  f.write({ id: "premature", method: "account/read", params: {} });
+  await eventually(() => f.backend.requests.some(message => message.id !== f.backend.requests[0].id));
+  assert.equal(f.bridge.health().initializeReplyForwarded, false);
+  held.release();
+  await eventually(() => f.bridge.health().initializeReplyForwarded);
+  nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { result: {} });
+  await eventually(() => f.desktop.some(message => message.id === "premature"));
+  assert.equal(f.bridge.health().postInitializePrimaryRequestSeen, false);
+  assert.equal(f.bridge.health().postInitializePrimarySuccessSeen, false);
+  assert.equal(f.bridge.health().primaryReady, false);
+});
+
+test("initialized before a held init response unlocks only once that response is successfully forwarded", async t => {
+  const held = heldOutput("desktop-init"), f = await fixture(t, { output: held.output });
+  initializePrimary(f);
+  await eventually(() => held.callbacks.length === 1);
+  f.write({ method: "initialized", params: {} });
+  await eventually(() => f.bridge.health().initializedNotificationSeen);
+  assert.equal(f.bridge.health().primaryReady, false);
+  held.release();
+  await eventually(() => f.bridge.health().primaryReady);
+  assert.equal(f.bridge.health().readyBasis, "initialized_notification");
+});
+
+test("initialized before any initialize request is forwarded transparently but cannot unlock readiness", async t => {
+  const f = await fixture(t);
+  f.write({ method: "initialized", params: {} });
+  await eventually(() => f.backend.requests.length === 1);
+  assert.equal(f.bridge.health().initializedNotificationSeen, false);
+  initializePrimary(f);
+  await eventually(() => f.bridge.health().initializeReplyForwarded);
+  assert.equal(f.bridge.health().primaryReady, false);
+  f.write({ method: "initialized", params: {} });
+  await eventually(() => f.bridge.health().primaryReady);
+  assert.equal(f.backend.requests.filter(message => message.method === "initialized").length, 2);
+});
+
+test("init errors and subsequent successful responses never imply successful initialization", async t => {
+  const f = await fixture(t, { respondInitialize: (message, child) => child.stdout.write(`${JSON.stringify({ id: message.id, error: { code: -32600, message: "fixture-private-error" } })}\n`) });
+  initializePrimary(f);
+  f.write({ method: "initialized", params: {} });
+  await eventually(() => f.bridge.health().initializeErrorForwarded);
+  f.write({ id: "after-error", method: "account/read", params: {} });
+  await eventually(() => f.backend.requests.some(message => message.method === "account/read"));
+  nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { result: {} });
+  await eventually(() => f.desktop.some(message => message.id === "after-error"));
+  assert.equal(f.bridge.health().initializeErrorSeen, true);
+  assert.equal(f.bridge.health().initializeResultSeen, false);
+  assert.equal(f.bridge.health().initializeReplyForwarded, false);
+  assert.equal(f.bridge.health().primaryReady, false);
+  assert.equal(JSON.stringify(f.bridge.health()).includes("fixture-private-error"), false);
+});
+
+test("post-init errors and desktop replies to server-initiated requests cannot unlock readiness", async t => {
+  const f = await fixture(t);
+  initializePrimary(f);
+  await eventually(() => f.bridge.health().initializeReplyForwarded);
+  f.write({ id: "unsuccessful", method: "account/read", params: {} });
+  await eventually(() => f.backend.requests.some(message => message.method === "account/read"));
+  nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { error: { code: -32600, message: "fixture error" } });
+  await eventually(() => f.desktop.some(message => message.id === "unsuccessful"));
+  f.backend.child.stdout.write(`${JSON.stringify({ id: 100, method: "attestation/generate", params: {} })}\n`);
+  await eventually(() => f.desktop.some(message => message.method === "attestation/generate"));
+  f.write({ id: f.desktop.find(message => message.method === "attestation/generate").id, result: { fixture: true } });
+  await eventually(() => f.backend.requests.some(message => message.id === 100));
+  assert.equal(f.bridge.health().postInitializePrimarySuccessSeen, false);
+  assert.equal(f.bridge.health().primaryReady, false);
+});
+
+test("follow-up native success waits for primary output completion before readiness", async t => {
+  const held = heldOutput("post-init"), f = await fixture(t, { output: held.output });
+  initializePrimary(f);
+  await eventually(() => f.bridge.health().initializeReplyForwarded);
+  f.write({ id: "post-init", method: "account/read", params: {} });
+  await eventually(() => f.backend.requests.some(message => message.method === "account/read"));
+  nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { result: {} });
+  await eventually(() => held.callbacks.length === 1);
+  assert.equal(f.bridge.health().primaryReady, false);
+  held.release();
+  await eventually(() => f.bridge.health().primaryReady);
+});
+
+for (const phase of ["init", "followup"]) {
+  test(`${phase} output write failure never publishes readiness`, async t => {
+    const held = heldOutput(phase === "init" ? "desktop-init" : "post-init"), f = await fixture(t, { output: held.output });
+    initializePrimary(f);
+    if (phase === "init") {
+      f.write({ method: "initialized", params: {} });
+    } else {
+      await eventually(() => f.bridge.health().initializeReplyForwarded);
+      f.write({ id: "post-init", method: "account/read", params: {} });
+      await eventually(() => f.backend.requests.some(message => message.method === "account/read"));
+      nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { result: {} });
+    }
+    await eventually(() => held.callbacks.length === 1);
+    held.release(new Error("fixture output failure"));
+    await f.bridge.completion;
+    assert.equal(f.statuses.some(status => status.primaryReady), false);
+    assert.equal(f.bridge.health().readyBasis, null);
+  });
+
+  test(`${phase} output completed after desktop EOF never publishes readiness`, async t => {
+    const held = heldOutput(phase === "init" ? "desktop-init" : "post-init"), f = await fixture(t, { output: held.output });
+    initializePrimary(f);
+    if (phase === "init") {
+      f.write({ method: "initialized", params: {} });
+      await eventually(() => f.bridge.health().initializedNotificationSeen);
+    } else {
+      await eventually(() => f.bridge.health().initializeReplyForwarded);
+      f.write({ id: "post-init", method: "account/read", params: {} });
+      await eventually(() => f.backend.requests.some(message => message.method === "account/read"));
+      nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { result: {} });
+    }
+    await eventually(() => held.callbacks.length === 1);
+    f.input.end();
+    await eventually(() => f.bridge.health().state !== "starting");
+    held.release();
+    await f.bridge.completion;
+    assert.equal(f.statuses.some(status => status.primaryReady), false);
+    assert.equal(f.bridge.health().readyBasis, null);
+  });
+}
+
+test("handshake diagnostics publish only on transitions and EOF revokes readiness", async t => {
+  const f = await fixture(t); await f.ready();
+  const before = f.statuses.length;
+  for (let index = 0; index < 10; index++) f.write({ method: "initialized", params: {} });
+  await eventually(() => f.backend.requests.filter(message => message.method === "initialized").length === 11);
+  assert.equal(f.statuses.length, before);
+  f.input.end(); await f.bridge.completion;
+  assert.equal(f.bridge.health().primaryReady, false);
+  assert.equal(f.bridge.health().readyBasis, null);
+});
+
+test("a failed status publication keeps secondary access closed after otherwise successful initialization", async t => {
+  const f = await fixture(t);
+  initializePrimary(f);
+  await eventually(() => f.bridge.health().initializeReplyForwarded);
+  fs.unlinkSync(f.config.statusFile);
+  fs.mkdirSync(f.config.statusFile); // Test-owned obstruction makes atomic replacement fail.
+  f.write({ id: "post-init", method: "account/read", params: {} });
+  await eventually(() => f.backend.requests.some(message => message.method === "account/read"));
+  nativeReply(f, f.backend.requests.find(message => message.method === "account/read"), { result: {} });
+  await eventually(() => f.bridge.health().postInitializePrimarySuccessSeen);
+  assert.equal(f.bridge.health().state, "status_unavailable");
+  assert.equal(f.bridge.health().primaryReady, false);
+  assert.equal(f.bridge.health().readyBasis, null);
+  await assert.rejects(f.connect(), /403/);
 });
 
 test("both streams get collision-free IDs and out-of-order responses return only to their owner", async t => {

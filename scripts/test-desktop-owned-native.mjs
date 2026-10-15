@@ -17,7 +17,8 @@ async function bounded(promise, milliseconds, fallback) {
   finally { clearTimeout(timer); }
 }
 
-export async function testDesktopOwnedNative(candidateManifest, validationDirectory) {
+export async function testDesktopOwnedNative(candidateManifest, validationDirectory, { primaryHandshake = "notification" } = {}) {
+  if (!["notification", "desktop-followup"].includes(primaryHandshake)) throw new Error("Unknown primary handshake validation mode; no launch.");
   if (!path.isAbsolute(candidateManifest) || !path.isAbsolute(validationDirectory)) throw new Error("Use absolute manifest and new validation-directory paths.");
   if (fs.existsSync(validationDirectory)) throw new Error("Validation directory must not already exist.");
   const manifest = JSON.parse(fs.readFileSync(candidateManifest, "utf8"));
@@ -34,7 +35,7 @@ export async function testDesktopOwnedNative(candidateManifest, validationDirect
   fs.writeFileSync(`${executable}.json`, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
   const proofFile = path.join(validationDirectory, "native-protocol-proof.json");
   const proof = { schema: "desktop-owned-native-protocol-smoke-v1", startedAt: new Date().toISOString(), candidateManifest,
-    syntheticPrimary: true, realDesktopTouched: false, modelPromptsSent: 0, desktopToolParityClaimed: false,
+    syntheticPrimary: true, primaryHandshake, realDesktopTouched: false, modelPromptsSent: 0, desktopToolParityClaimed: false,
     forcedTermination: false, port: config.port, operations: [], serverRequestMethods: [], stderrBytes: 0 };
   const save = () => fs.writeFileSync(proofFile, `${JSON.stringify(proof, null, 2)}\n`);
   const args = ["-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled", "-c", "features.prefer_mxc=true",
@@ -82,7 +83,15 @@ export async function testDesktopOwnedNative(candidateManifest, validationDirect
     const initialized = await request(true, "initialize", { clientInfo: { name: "whatsapp_bridge_protocol_validation", version: "1" }, capabilities: { experimentalApi: true } });
     if (initialized.error) throw new Error("Native initialization rejected.");
     proof.operations.push({ method: "initialize", success: true });
-    child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
+    if (primaryHandshake === "notification") {
+      child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
+    } else {
+      // Exercise the installed desktop's sequence without inventing its omitted
+      // notification. Only native metadata is requested; no chat is resumed.
+      const followup = await request(true, "thread/loaded/list", { limit: 10 });
+      proof.operations.push({ method: "thread/loaded/list", side: "primary", success: !followup.error });
+      if (followup.error) throw new Error("Native desktop-followup metadata request rejected.");
+    }
     const challenge = "a".repeat(32);
     for (let tries = 0; tries < 100; tries++) {
       const response = await fetch(`http://127.0.0.1:${config.port}/health?challenge=${challenge}`, { signal: AbortSignal.timeout(2000) });
@@ -131,9 +140,9 @@ export async function testDesktopOwnedNative(candidateManifest, validationDirect
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [manifest, directory] = process.argv.slice(2);
-  if (!manifest || !directory) throw new Error("Usage: node scripts/test-desktop-owned-native.mjs ABSOLUTE_CANDIDATE_MANIFEST ABSOLUTE_NEW_VALIDATION_DIRECTORY");
-  const result = await testDesktopOwnedNative(manifest, directory);
+  const [manifest, directory, mode, ...extra] = process.argv.slice(2);
+  if (!manifest || !directory || extra.length || (mode !== undefined && mode !== "--desktop-followup")) throw new Error("Usage: node scripts/test-desktop-owned-native.mjs ABSOLUTE_CANDIDATE_MANIFEST ABSOLUTE_NEW_VALIDATION_DIRECTORY [--desktop-followup]");
+  const result = await testDesktopOwnedNative(manifest, directory, { primaryHandshake: mode ? "desktop-followup" : "notification" });
   console.log(JSON.stringify(result));
   if (!result.protocolPassed || !result.nativeProcessChainExited || result.shimExitCode !== 0) process.exitCode = 1;
 }

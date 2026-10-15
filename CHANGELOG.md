@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Recognize desktop initialization that proceeds directly to subsequent requests without an `initialized` notification. Require successful desktop-owned responses before admitting gateway connections, and expose sanitized handshake progress for startup diagnosis.
 - Retain a newly created gateway conversation's connection through its first prompt. When the installed gateway supports the dedicated first-turn handoff, use its original creation response instead of querying history that does not exist yet. Older gateway cores refuse creation before starting a conversation.
 - Describe an unsuccessful ownership check accurately without claiming the desktop disconnected when the observation itself was too slow.
 

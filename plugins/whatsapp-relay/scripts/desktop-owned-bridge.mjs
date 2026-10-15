@@ -140,11 +140,21 @@ export async function startDesktopBridge(configValue, nativeArgs, {
   const instanceId = randomUUID();
   let child, state = "starting", primaryReady = false, nativeInitResult, nativeExperimental = false;
   let primaryInitialized = false, shuttingDown = false, counter = 0, childEnded = false, fatalCode = null, shutdownTimer, statusHealthy = true, primaryUnavailable = false;
+  let initializeRequestSeen = false, initializeRequestForwarded = false, initializeReplyForwarded = false;
+  let initializeErrorSeen = false, initializeErrorForwarded = false;
+  let postInitializePrimaryRequestSeen = false, postInitializePrimarySuccessSeen = false;
   const clients = new Set(), pending = new Map(), desktopIds = new Set(), serverRequests = new Map(), serverDesktopIds = new Map(), completedServerRequests = new Map(), canceledServerIds = new Set();
   const primaryWriter = new BoundedWriter(output, config.maxQueueBytes);
   const stderrWriter = new BoundedWriter(errors, config.maxQueueBytes);
   let nativeWriter;
-  const health = () => ({ schema: "codex-desktop-stdio-health-v1", instanceId, bridgePid: process.pid, backendPid: child?.pid ?? null, primaryReady: primaryReady && statusHealthy && !shuttingDown, state: statusHealthy ? state : "status_unavailable" });
+  const health = () => {
+    const ready = primaryReady && statusHealthy && !shuttingDown;
+    return { schema: "codex-desktop-stdio-health-v1", instanceId, bridgePid: process.pid, backendPid: child?.pid ?? null, primaryReady: ready, state: statusHealthy ? state : "status_unavailable",
+      initializeRequestSeen, initializeRequestForwarded, initializeResultSeen: nativeInitResult !== undefined, initializeReplyForwarded,
+      initializeErrorSeen, initializeErrorForwarded,
+      initializedNotificationSeen: primaryInitialized, postInitializePrimaryRequestSeen, postInitializePrimarySuccessSeen,
+      readyBasis: ready ? (primaryInitialized ? "initialized_notification" : "desktop_followup_response") : null };
+  };
   function status() {
     statusHealthy = true;
     const value = { ...health(), parentPid: process.ppid, shimPid: process.ppid, execPath: process.execPath, scriptPath: fileURLToPath(import.meta.url), configPath, recordedAt: new Date().toISOString() };
@@ -154,6 +164,15 @@ export async function startDesktopBridge(configValue, nativeArgs, {
       fs.writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
       fs.renameSync(temporary, config.statusFile);
     } catch { statusHealthy = false; }
+  }
+  function updateReadiness() {
+    // Some real desktop versions omit initialized. Observe their successful
+    // follow-up RPC instead; never synthesize initialization or test requests.
+    if (!shuttingDown) {
+      primaryReady = initializeReplyForwarded && nativeInitResult !== undefined && (primaryInitialized || postInitializePrimarySuccessSeen);
+      state = primaryReady ? "ready" : "starting";
+    }
+    status();
   }
   const server = http.createServer((request, response) => {
     let url;
@@ -194,11 +213,21 @@ export async function startDesktopBridge(configValue, nativeArgs, {
     if (ids.has(key) || pending.size >= config.maxPending || (client && ids.size >= config.maxSecondaryPending)) throw fail("Duplicate request ID or in-flight limit reached.");
     const id = `bridge:${instanceId}:${++counter}`;
     ids.add(key);
-    const record = { client, id: message.id, key, method: message.method };
+    // Eligibility is captured when the desktop request arrives, not when its
+    // response arrives: a pre-initialization request must never unlock access.
+    const postInitializePrimary = !client && message.method !== "initialize" && initializeReplyForwarded;
+    const record = { client, id: message.id, key, method: message.method, postInitializePrimary };
     pending.set(id, record);
-    if (!client && message.method === "initialize") nativeExperimental = message.params?.capabilities?.experimentalApi === true;
+    if (!client && message.method === "initialize") {
+      nativeExperimental = message.params?.capabilities?.experimentalApi === true;
+      if (!initializeRequestSeen) { initializeRequestSeen = true; status(); }
+    }
+    if (postInitializePrimary && !postInitializePrimaryRequestSeen) { postInitializePrimaryRequestSeen = true; status(); }
     // Keep this tombstone even if a socket vanishes after the write. No replay.
-    try { await nativeWriter.write({ ...message, id }); }
+    try {
+      await nativeWriter.write({ ...message, id });
+      if (!client && message.method === "initialize" && !initializeRequestForwarded) { initializeRequestForwarded = true; status(); }
+    }
     catch { throw Object.assign(fail("Native write outcome is uncertain."), { deliveryUncertain: true }); }
   }
   async function desktopFrame(message) {
@@ -206,7 +235,7 @@ export async function startDesktopBridge(configValue, nativeArgs, {
       if (own(message, "id")) await upstream(message);
       else {
         await nativeWriter.write(message);
-        if (message.method === "initialized") { primaryInitialized = true; primaryReady = nativeInitResult !== undefined; state = primaryReady ? "ready" : "starting"; status(); }
+        if (message.method === "initialized" && initializeRequestForwarded && !primaryInitialized) { primaryInitialized = true; updateReadiness(); }
       }
     } else if (own(message, "id") && (own(message, "result") || own(message, "error"))) {
       const key = idKey(message.id);
@@ -219,8 +248,8 @@ export async function startDesktopBridge(configValue, nativeArgs, {
     } else throw fail("Invalid desktop JSON-RPC frame.");
   }
   async function toDesktop(message) {
-    if (primaryUnavailable) return;
-    try { await primaryWriter.write(message); } catch (error) { if (!shuttingDown) throw error; }
+    if (primaryUnavailable) return false;
+    try { await primaryWriter.write(message); return true; } catch (error) { if (!shuttingDown) throw error; return false; }
   }
   async function backendFrame(message) {
     if (typeof message.method === "string") {
@@ -259,12 +288,23 @@ export async function startDesktopBridge(configValue, nativeArgs, {
     (record.client ? record.client.ids : desktopIds).delete(record.key);
     const restored = { ...message, id: record.id };
     if (!record.client) {
-      if (record.method === "initialize" && own(message, "result")) {
+      const succeeded = own(message, "result") && !own(message, "error");
+      if (record.method === "initialize" && own(message, "error") && !initializeErrorSeen) { initializeErrorSeen = true; status(); }
+      if (record.method === "initialize" && succeeded && object(message.result) && nativeInitResult === undefined) {
         nativeInitResult = message.result;
-        if (!shuttingDown) { primaryReady = primaryInitialized; state = primaryReady ? "ready" : "starting"; }
         status();
       }
-      await toDesktop(restored);
+      const forwarded = await toDesktop(restored);
+      if (forwarded && !shuttingDown) {
+        if (record.method === "initialize" && own(message, "error") && !initializeErrorForwarded) { initializeErrorForwarded = true; status(); }
+        if (record.method === "initialize" && succeeded && object(message.result) && !initializeReplyForwarded) {
+          initializeReplyForwarded = true;
+          updateReadiness();
+        } else if (record.postInitializePrimary && succeeded && !postInitializePrimarySuccessSeen) {
+          postInitializePrimarySuccessSeen = true;
+          updateReadiness();
+        }
+      }
     } else {
       const threadId = message.result?.thread?.id;
       if (typeof threadId === "string") record.client.threads.add(threadId);
