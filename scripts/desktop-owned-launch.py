@@ -31,13 +31,43 @@ POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
 class LaunchError(RuntimeError):
-    def __init__(self, code, *, uncertain=False):
+    def __init__(self, code, *, uncertain=False, details=None, identity_unavailable=False):
         super().__init__(code)
         self.code, self.uncertain = code, uncertain
+        self.details, self.identity_unavailable = details or {}, identity_unavailable
 
 
-def fail(code, *, uncertain=False):
-    raise LaunchError(code, uncertain=uncertain)
+def fail(code, *, uncertain=False, details=None):
+    raise LaunchError(code, uncertain=uncertain, details=details)
+
+
+def missing_identity(row):
+    return row is not None and (not row.get("path") or type(row.get("createdTicks")) is not int)
+
+
+def identity_error(code, expected, observed):
+    # Only executable identity and OS error metadata; never argv, environment or RPC data.
+    fields = ("pid", "ppid", "name", "path", "createdTicks", "identityError")
+    return LaunchError(code, identity_unavailable=missing_identity(observed), details={
+        "pid": expected["pid"], "expected": dict(expected),
+        "observed": {key: observed[key] for key in fields if key in observed}})
+
+
+def observe_with_rechecks(runtime, observe, *, snapshot=None, sleep=time.sleep, clock=time.monotonic):
+    """At most three observations, never a launch retry or an inferred process exit."""
+    snapshot = runtime.snapshot() if snapshot is None else snapshot
+    deadline = clock() + 1.0
+    for attempt in range(3):
+        try:
+            return observe(snapshot), snapshot
+        except LaunchError as error:
+            if not error.identity_unavailable:
+                raise
+            error.details["identityObservations"] = attempt + 1
+            if attempt == 2 or clock() >= deadline:
+                raise
+            sleep(0.05)
+            snapshot = runtime.snapshot()
 
 
 def utc():
@@ -200,11 +230,13 @@ class QuitTracker:
     def observe(self, snapshot):
         if not isinstance(snapshot, dict):
             fail("invalid_process_snapshot")
-        if self.retained_root and not same(snapshot.get(self.old["pid"]), self.old):
+        if self.retained_root and not same(snapshot.get(self.old["pid"]), self.old) and not (
+                self.started and missing_identity(snapshot.get(self.old["pid"]))):
             fail("old_backend_identity_changed")
         if not self.started and not same(snapshot.get(self.old["pid"]), self.old):
             fail("old_desktop_not_exactly_present")
         self.started = True
+        unavailable = None
         for pid, expected in self.tracked.items():
             if pid in snapshot and not same(snapshot[pid], expected):
                 replacement = snapshot[pid]
@@ -215,7 +247,10 @@ class QuitTracker:
                     self.retired.add(pid)
                     self.retired_at.setdefault(pid, replacement["createdTicks"])
                 else:
-                    fail("tracked_process_replaced_or_unreadable")
+                    error = identity_error("tracked_process_replaced_or_unreadable", expected, replacement)
+                    if not error.identity_unavailable:
+                        raise error
+                    unavailable = unavailable or error
             elif pid in self.retired and pid in snapshot:
                 fail("retired_identity_reappeared")
         changed = True
@@ -252,6 +287,10 @@ class QuitTracker:
                     fail("another_desktop_observed")
         self.remaining = sum(pid in snapshot and pid not in self.retired
                              and not (self.retained_root and pid == self.old["pid"]) for pid in self.tracked)
+        # Keep every safely observed descendant/retirement before resampling. A new
+        # ambiguous/orphan descendant above fails immediately, even during a recheck.
+        if unavailable:
+            raise unavailable
         return self.remaining == 0
 
     def checkpoint(self):
@@ -303,21 +342,62 @@ def manager_gate(config, snapshot):
         fail("old_backend_admission_acknowledgment_required")
 
 
+def observe_owned_trees(config, snapshot, tracker, backend):
+    manager_gate(config, snapshot)
+    unavailable = None
+    for tree in (tracker, backend):
+        if tree is None:
+            continue
+        try:
+            tree.observe(snapshot)
+        except LaunchError as error:
+            if not error.identity_unavailable:
+                raise
+            unavailable = unavailable or error
+    waiter_tree_gate(tracker, backend)
+    if unavailable:
+        raise unavailable
+    return tracker.remaining == 0
+
+
 def final_process_gate(config, tracked, snapshot, *, backend=None):
     manager_gate(config, snapshot)
+    unavailable = None
     if "oldBackend" in config:
         if backend is None:
             fail("old_backend_tracking_required")
-        if not backend.observe(snapshot):
-            fail("old_backend_descendants_still_present")
+        try:
+            if not backend.observe(snapshot):
+                fail("old_backend_descendants_still_present")
+        except LaunchError as error:
+            if not error.identity_unavailable:
+                raise
+            unavailable = error
+    unreadable_pids = set()
     for item in tracked:
         actual = snapshot.get(item["pid"])
+        if missing_identity(actual):
+            unavailable = unavailable or identity_error("old_process_still_present_or_ambiguous", item, actual)
+            unreadable_pids.add(item["pid"])
+            continue
         if actual and (not actual.get("path") or type(actual.get("createdTicks")) is not int
                        or actual["createdTicks"] <= item["createdTicks"]):
-            fail("old_process_still_present_or_ambiguous")
+            raise identity_error("old_process_still_present_or_ambiguous", item, actual)
+    tracked_by_pid = {item["pid"]: item for item in tracked}
+    for pid, actual in snapshot.items():
+        parent = tracked_by_pid.get(actual.get("ppid"))
+        if parent is not None and pid not in tracked_by_pid:
+            current_parent = snapshot.get(parent["pid"])
+            if (current_parent is None or missing_identity(current_parent)
+                    or current_parent["createdTicks"] <= parent["createdTicks"]):
+                fail("unobserved_descendant_after_parent_exit")
+            if missing_identity(actual) or actual["createdTicks"] < current_parent["createdTicks"]:
+                fail("historical_backend_parentage_ambiguous")
     desktop_name = Path(config["oldDesktop"]["path"]).name.casefold()
-    if any(item.get("name", "").casefold() == desktop_name for item in snapshot.values()):
+    if any(item.get("name", "").casefold() == desktop_name and pid not in unreadable_pids for pid, item in snapshot.items()):
         fail("another_desktop_observed")
+    if unavailable:
+        raise unavailable
 
 
 def old_backend_count(config, runtime, *, tracker=None):
@@ -327,13 +407,14 @@ def old_backend_count(config, runtime, *, tracker=None):
     server = backend["server"]
     port = urlsplit(backend["endpoint"]).port
     def verify():
-        snapshot = runtime.snapshot()
-        if not same(snapshot.get(server["pid"]), server):
-            fail("old_backend_identity_changed")
-        if tracker:
-            tracker.observe(snapshot)
-        if runtime.listener_owners(port) != {server["pid"]}:
-            fail("old_backend_listener_mismatch")
+        def observe(snapshot):
+            if tracker:
+                tracker.observe(snapshot)
+            elif not same(snapshot.get(server["pid"]), server):
+                fail("old_backend_identity_changed")
+            if runtime.listener_owners(port) != {server["pid"]}:
+                fail("old_backend_listener_mismatch")
+        observe_with_rechecks(runtime, observe)
     verify()
     try:
         count = runtime.loaded_thread_count(backend)
@@ -363,13 +444,13 @@ class WindowsRuntime:
         kernel.OpenProcess.restype = w.HANDLE
         handle = kernel.OpenProcess(0x1000, False, pid)
         if not handle:
-            return {}
+            return {"identityError": {"phase": "OpenProcess", "win32Error": ctypes.get_last_error()}}
         kernel.CloseHandle.argtypes = [w.HANDLE]
         kernel.CloseHandle.restype = w.BOOL
         try:
             return self._handle_identity(handle)
-        except LaunchError:
-            return {}
+        except LaunchError as error:
+            return {"identityError": error.details}
         finally:
             if not kernel.CloseHandle(handle):
                 fail("process_handle_close_failed")
@@ -383,9 +464,10 @@ class WindowsRuntime:
         kernel.QueryFullProcessImageNameW.restype = w.BOOL
         length = w.DWORD(32768)
         filename = ctypes.create_unicode_buffer(length.value)
-        if (not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kt), ctypes.byref(ut))
-                or not kernel.QueryFullProcessImageNameW(handle, 0, filename, ctypes.byref(length))):
-            fail("process_identity_unavailable")
+        if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kt), ctypes.byref(ut)):
+            fail("process_identity_unavailable", details={"phase": "GetProcessTimes", "win32Error": ctypes.get_last_error()})
+        if not kernel.QueryFullProcessImageNameW(handle, 0, filename, ctypes.byref(length)):
+            fail("process_identity_unavailable", details={"phase": "QueryFullProcessImageNameW", "win32Error": ctypes.get_last_error()})
         return {"createdTicks": (created.dwHighDateTime << 32) | created.dwLowDateTime, "path": filename.value}
 
     def snapshot(self):
@@ -565,7 +647,8 @@ def invoke_once(config, config_path, role, tracked, runtime, *, backend_state=No
             or result.get("role") != role or result.get("schema") != "codex-desktop-owned-launch-result-v1"):
         fail("package_result_mismatch", uncertain=True)
     if result.get("status") != "success":
-        fail("package_wrapper_refused", uncertain=result.get("launchReserved") is True)
+        fail("package_wrapper_refused", uncertain=result.get("launchReserved") is True,
+             details=result.get("error", {}).get("details"))
     if (result.get("packageFullName") != config["package"]["fullName"]
             or result.get("applicationUserModelId") != config["package"]["familyName"] + "!" + config["package"]["appId"]
             or result.get("executeAccess") is not True or result.get("accessHandleClosed") is not True
@@ -583,12 +666,7 @@ def arm_and_wait(config, config_path, runtime, *, sleep=time.sleep, clock=time.m
     validate_config(config, computer=os.environ.get("COMPUTERNAME", ""))
     tracker = QuitTracker(config["oldDesktop"])
     backend = backend_tracker(config)
-    snapshot = runtime.snapshot()
-    manager_gate(config, snapshot)
-    tracker.observe(snapshot)
-    if backend:
-        backend.observe(snapshot)
-    waiter_tree_gate(tracker, backend)
+    observe_with_rechecks(runtime, lambda snapshot: observe_owned_trees(config, snapshot, tracker, backend), sleep=sleep, clock=clock)
     directory = Path(config["stateDir"])
     directory.mkdir(parents=True, exist_ok=True)
     reservation = {"schema": SCHEMA, "configSha256": sha(config_path), "armedAt": utc(),
@@ -606,12 +684,8 @@ def arm_and_wait(config, config_path, runtime, *, sleep=time.sleep, clock=time.m
                 **({"backendTracking": backend.checkpoint()} if backend else {})}
     try:
         while clock() < (idle_deadline if idle_deadline is not None else deadline):
-            snapshot = runtime.snapshot()
-            manager_gate(config, snapshot)
-            drained = tracker.observe(snapshot)
-            if backend:
-                backend.observe(snapshot)
-            waiter_tree_gate(tracker, backend)
+            drained, snapshot = observe_with_rechecks(runtime,
+                lambda current: observe_owned_trees(config, current, tracker, backend), sleep=sleep, clock=clock)
             if not drained:
                 wait_status(directory, "waiting_for_normal_quit", remainingOldProcesses=tracker.remaining, **tracking_fields())
                 sleep(config.get("pollSeconds", 5))
@@ -624,8 +698,11 @@ def arm_and_wait(config, config_path, runtime, *, sleep=time.sleep, clock=time.m
             if remaining == 0:
                 validate_config(config, computer=os.environ.get("COMPUTERNAME", ""))
                 snapshot = runtime.snapshot()
-                if backend is None or backend.observe(snapshot):
-                    final_process_gate(config, list(tracker.tracked.values()), snapshot, backend=backend)
+                if backend is not None:
+                    backend_drained, snapshot = observe_with_rechecks(runtime, backend.observe, snapshot=snapshot, sleep=sleep, clock=clock)
+                if backend is None or backend_drained:
+                    observe_with_rechecks(runtime, lambda current: final_process_gate(config, list(tracker.tracked.values()), current, backend=backend),
+                                          snapshot=snapshot, sleep=sleep, clock=clock)
                     wait_status(directory, "package_launch_attempt_reserved", **tracking_fields())
                     result = invoke_once(config, config_path, "launch", list(tracker.tracked.values()), runtime,
                                          backend_state=backend.checkpoint() if backend else None, sleep=sleep, clock=clock)
@@ -637,9 +714,10 @@ def arm_and_wait(config, config_path, runtime, *, sleep=time.sleep, clock=time.m
             sleep(config.get("pollSeconds", 5))
         fail("old_backend_idle_deadline_no_launch" if idle_deadline is not None else "wait_deadline_no_launch")
     except Exception as error:
-        wait_status(directory, "blocked", code=getattr(error, "code", "wait_failed"), uncertain=getattr(error, "uncertain", False), **tracking_fields())
+        details = {"details": error.details} if isinstance(error, LaunchError) and error.details else {}
+        wait_status(directory, "blocked", code=getattr(error, "code", "wait_failed"), uncertain=getattr(error, "uncertain", False), **details, **tracking_fields())
         publish(directory / "wait-outcome.json", {"status": "stopped", "code": getattr(error, "code", "wait_failed"),
-                "uncertain": getattr(error, "uncertain", False), "automaticRetry": False, "recordedAt": utc(), **tracking_fields()})
+                "uncertain": getattr(error, "uncertain", False), "automaticRetry": False, "recordedAt": utc(), **details, **tracking_fields()})
         raise
 
 
@@ -698,11 +776,11 @@ def run_wrapper(request_path, runtime=None):
                 or result.get("executeAccess") is not True or result.get("accessHandleClosed") is not True):
             fail("package_access_proof_mismatch")
         if request["role"] == "launch":
-            final_process_gate(config, request["tracked"], runtime.snapshot(), backend=backend)
+            observe_with_rechecks(runtime, lambda current: final_process_gate(config, request["tracked"], current, backend=backend))
             if not old_backend_empty(config, runtime, tracker=backend):
                 fail("old_backend_has_loaded_threads")
             validate_config(config, computer=os.environ.get("COMPUTERNAME", ""))
-            final_process_gate(config, request["tracked"], runtime.snapshot(), backend=backend)
+            observe_with_rechecks(runtime, lambda current: final_process_gate(config, request["tracked"], current, backend=backend))
             exclusive(request_path.with_name("desktop-launch-reservation.json"), {"requestId": request["requestId"],
                       "configSha256": request["configSha256"], "outcome": "uncertain_until_result", "automaticRetry": False, "reservedAt": utc()})
             result["launchReserved"] = True
@@ -711,6 +789,8 @@ def run_wrapper(request_path, runtime=None):
         result["status"] = "success"
     except Exception as error:
         result["error"] = {"code": getattr(error, "code", "wrapper_operation_failed"), "type": type(error).__name__}
+        if isinstance(error, LaunchError) and error.details:
+            result["error"]["details"] = error.details
     if backend:
         result["backendTracking"] = backend.checkpoint()
     publish(result_path(request_path), result)

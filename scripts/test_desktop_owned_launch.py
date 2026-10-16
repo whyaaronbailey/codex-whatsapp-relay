@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SOURCE = Path(__file__).with_name("desktop-owned-launch.py")
 SPEC = importlib.util.spec_from_file_location("desktop_owned_launch", SOURCE)
@@ -187,6 +187,124 @@ class Tests(unittest.TestCase):
         tracker = launch.QuitTracker(exact(self.old)); tracker.observe({10: self.old})
         with self.assertRaisesRegex(launch.LaunchError, "tracked_process_replaced_or_unreadable"):
             tracker.observe({10: {"pid": 10, "ppid": 1, "name": "other.exe"}})
+
+    def unreadable(self, pid=10, ppid=1):
+        return {"pid": pid, "ppid": ppid, "name": "exiting.exe",
+                "identityError": {"phase": "OpenProcess", "win32Error": 87}}
+
+    def recheck(self, runtime, observe):
+        return launch.observe_with_rechecks(runtime, observe, sleep=self.clock.sleep, clock=self.clock)
+
+    def test_enumerated_desktop_exits_before_identity_read_then_launches_once(self):
+        runtime = MockRuntime(self.config, [{10: self.old}, {10: self.unreadable()}, {}])
+        self.assertEqual(self.arm(runtime)["status"], "success")
+        self.assertEqual(len(runtime.invocations), 1)
+        self.assertEqual(len(runtime.launches), 1)
+
+    def test_unavailable_tracked_child_can_resolve_same_or_proven_newer(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        for resolved in (child, process(56, 200, self.files["pythonw.exe"])):
+            with self.subTest(resolved=resolved):
+                tracker = launch.backend_tracker(self.config)
+                tracker.observe({55: self.backend, 56: child})
+                runtime = MockRuntime(self.config, [{55: self.backend, 56: self.unreadable(56, 55)}, {55: self.backend, 56: resolved}])
+                drained, _ = self.recheck(runtime, tracker.observe)
+                self.assertEqual(drained, resolved is not child)
+                self.assertEqual(tracker.tracked[56], exact(child))
+                if resolved is not child:
+                    restored = launch.backend_tracker(self.config, tracker.checkpoint())
+                    self.assertEqual(restored.retired_at, {56: 200})
+
+    def test_persistent_missing_birth_is_bounded_durable_and_never_launches(self):
+        unknown = {**self.unreadable(), "path": str(self.files["node.exe"])}
+        runtime = MockRuntime(self.config, [{10: self.old}, {10: unknown}])
+        with self.assertRaisesRegex(launch.LaunchError, "tracked_process_replaced_or_unreadable"):
+            self.arm(runtime)
+        self.assertEqual(runtime.invocations, [])
+        self.assertEqual(runtime.launches, [])
+        for name in ("wait-status.json", "wait-outcome.json"):
+            details = launch.load(Path(self.config["stateDir"]) / name)["details"]
+            self.assertEqual(details["pid"], 10)
+            self.assertEqual(details["expected"], exact(self.old))
+            self.assertEqual(details["observed"]["identityError"], {"phase": "OpenProcess", "win32Error": 87})
+            self.assertEqual(details["identityObservations"], 3)
+        self.assertAlmostEqual(self.clock.value, .1)
+
+    def test_readable_identity_mismatch_is_not_retried(self):
+        tracker = launch.QuitTracker(exact(self.old)); tracker.observe({10: self.old})
+        changed = {**self.old, "path": str(self.files["node.exe"])}
+        runtime = MockRuntime(self.config, [{10: changed}, {}])
+        with self.assertRaises(launch.LaunchError) as caught:
+            self.recheck(runtime, tracker.observe)
+        self.assertFalse(caught.exception.identity_unavailable)
+        self.assertEqual(runtime.snapshots, [{}])
+        self.assertEqual(self.clock.value, 0)
+
+    def test_unknown_new_descendant_is_not_hidden_by_identity_recheck(self):
+        child = process(11, 110, self.files["node.exe"], 10)
+        for snapshots in ([{10: self.unreadable(), 11: child}, {}],
+                          [{10: self.unreadable()}, {11: child}, {}]):
+            with self.subTest(snapshots=snapshots):
+                tracker = launch.QuitTracker(exact(self.old)); tracker.observe({10: self.old})
+                runtime = MockRuntime(self.config, snapshots)
+                with self.assertRaisesRegex(launch.LaunchError, "unobserved_descendant_after_parent_exit"):
+                    self.recheck(runtime, tracker.observe)
+                self.assertEqual(runtime.snapshots[-1], {})
+
+    def test_recheck_preserves_new_descendants_from_other_owned_tree(self):
+        self.old_backend(); tracker = launch.QuitTracker(exact(self.old)); backend = launch.backend_tracker(self.config)
+        initial = {10: self.old, 55: self.backend}
+        launch.observe_owned_trees(self.config, initial, tracker, backend)
+        child = process(56, 60, self.files["node.exe"], 55)
+        runtime = MockRuntime(self.config, [{10: self.unreadable(), 55: self.backend, 56: child}, {55: self.backend}])
+        self.recheck(runtime, lambda snapshot: launch.observe_owned_trees(self.config, snapshot, tracker, backend))
+        self.assertEqual(backend.tracked[56], exact(child))
+
+    def test_final_gate_rechecks_unavailable_tracked_identity_but_not_orphan(self):
+        callback = lambda snapshot: launch.final_process_gate(self.config, [exact(self.old)], snapshot)
+        runtime = MockRuntime(self.config, [{10: {**self.unreadable(), "name": self.desktop.name}}, {}])
+        self.recheck(runtime, callback)
+        child = process(11, 110, self.files["node.exe"], 10)
+        runtime = MockRuntime(self.config, [{10: self.unreadable(), 11: child}, {}])
+        with self.assertRaisesRegex(launch.LaunchError, "unobserved_descendant_after_parent_exit"):
+            self.recheck(runtime, callback)
+        self.assertEqual(runtime.snapshots, [{}])
+
+    def test_final_gate_new_parent_incarnation_does_not_hide_older_or_unknown_child(self):
+        replacement = process(10, 200, self.files["node.exe"])
+        for child in (process(11, 110, self.files["real-cli.exe"], 10), self.unreadable(11, 10)):
+            with self.subTest(child=child), self.assertRaisesRegex(launch.LaunchError, "historical_backend_parentage_ambiguous"):
+                launch.final_process_gate(self.config, [exact(self.old)], {10: replacement, 11: child})
+        launch.final_process_gate(self.config, [exact(self.old)],
+                                  {10: replacement, 11: process(11, 210, self.files["real-cli.exe"], 10)})
+
+    def test_wrapper_persistent_identity_failure_is_durable_before_launch_reservation(self):
+        runtime = MockRuntime(self.config, [{10: self.old}, {}, {}])
+        invoke = runtime.invoke_package
+        def race(config, request_path):
+            runtime.last = {10: self.unreadable()}
+            return invoke(config, request_path)
+        runtime.invoke_package = race
+        with self.assertRaisesRegex(launch.LaunchError, "package_wrapper_refused"):
+            self.arm(runtime)
+        result = launch.load(launch.result_path(runtime.invocations[0]))
+        self.assertEqual(result["error"]["details"]["identityObservations"], 3)
+        self.assertEqual(result["error"]["details"]["pid"], 10)
+        self.assertEqual(runtime.launches, [])
+        self.assertFalse(runtime.invocations[0].with_name("desktop-launch-reservation.json").exists())
+
+    def test_win32_identity_failure_preserves_phase_and_error_without_inferred_exit(self):
+        runtime = object.__new__(launch.WindowsRuntime); runtime.kernel = Mock()
+        runtime.kernel.OpenProcess.return_value = 0
+        with patch.object(launch.ctypes, "get_last_error", return_value=87, create=True):
+            self.assertEqual(runtime._process_identity(10), {"identityError": {"phase": "OpenProcess", "win32Error": 87}})
+        runtime.kernel.OpenProcess.return_value = 123
+        runtime.kernel.CloseHandle.return_value = True
+        error = launch.LaunchError("process_identity_unavailable", details={"phase": "GetProcessTimes", "win32Error": 5})
+        with patch.object(runtime, "_handle_identity", side_effect=error):
+            self.assertEqual(runtime._process_identity(10), {"identityError": error.details})
+        runtime.kernel.CloseHandle.assert_called_once_with(123)
 
     def test_child_discovered_after_parent_exit_is_ambiguous(self):
         tracker = launch.QuitTracker(exact(self.old)); tracker.observe({10: self.old})
