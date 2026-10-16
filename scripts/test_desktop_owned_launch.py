@@ -241,16 +241,17 @@ class Tests(unittest.TestCase):
         self.assertEqual(runtime.snapshots, [{}])
         self.assertEqual(self.clock.value, 0)
 
-    def test_unknown_new_descendant_is_not_hidden_by_identity_recheck(self):
+    def test_readable_orphan_is_retained_across_identity_recheck(self):
         child = process(11, 110, self.files["node.exe"], 10)
         for snapshots in ([{10: self.unreadable(), 11: child}, {}],
                           [{10: self.unreadable()}, {11: child}, {}]):
             with self.subTest(snapshots=snapshots):
                 tracker = launch.QuitTracker(exact(self.old)); tracker.observe({10: self.old})
                 runtime = MockRuntime(self.config, snapshots)
-                with self.assertRaisesRegex(launch.LaunchError, "unobserved_descendant_after_parent_exit"):
-                    self.recheck(runtime, tracker.observe)
-                self.assertEqual(runtime.snapshots[-1], {})
+                drained, snapshot = self.recheck(runtime, tracker.observe)
+                self.assertEqual(tracker.tracked[11], exact(child))
+                self.assertEqual(drained, 11 not in snapshot)
+                self.assertTrue(tracker.observe({}))
 
     def test_recheck_preserves_new_descendants_from_other_owned_tree(self):
         self.old_backend(); tracker = launch.QuitTracker(exact(self.old)); backend = launch.backend_tracker(self.config)
@@ -306,10 +307,35 @@ class Tests(unittest.TestCase):
             self.assertEqual(runtime._process_identity(10), {"identityError": error.details})
         runtime.kernel.CloseHandle.assert_called_once_with(123)
 
-    def test_child_discovered_after_parent_exit_is_ambiguous(self):
+    def test_child_discovered_after_parent_exit_blocks_until_it_drains(self):
         tracker = launch.QuitTracker(exact(self.old)); tracker.observe({10: self.old})
-        with self.assertRaisesRegex(launch.LaunchError, "unobserved_descendant"):
-            tracker.observe({11: process(11, 110, self.files["node.exe"], 10)})
+        child = process(11, 110, self.files["node.exe"], 10)
+        self.assertFalse(tracker.observe({11: child}))
+        self.assertEqual(tracker.tracked[11], exact(child))
+        self.assertTrue(tracker.observe({}))
+
+    def test_readable_orphan_and_later_grandchild_must_drain_before_launch(self):
+        child = process(11, 110, self.files["node.exe"], 10)
+        grandchild = process(12, 120, self.files["node.exe"], 11)
+        runtime = MockRuntime(self.config, [{10: self.old}, {11: child}, {12: grandchild}, {}])
+        self.assertEqual(self.arm(runtime)["status"], "success")
+        request = launch.load(runtime.invocations[0])
+        self.assertEqual({row["pid"] for row in request["tracked"]}, {10, 11, 12})
+        self.assertEqual(len(runtime.launches), 1)
+        self.assertGreaterEqual(self.clock.value, 2 * self.config["pollSeconds"])
+
+    def test_unreadable_new_orphan_is_refused_with_safe_durable_parentage(self):
+        child = {**self.unreadable(11, 10), "CommandLine": "must not be recorded"}
+        runtime = MockRuntime(self.config, [{10: self.old}, {11: child}])
+        with self.assertRaisesRegex(launch.LaunchError, "descendant_identity_ambiguous"):
+            self.arm(runtime)
+        details = launch.load(Path(self.config["stateDir"]) / "wait-outcome.json")["details"]
+        self.assertEqual(details["parent"], exact(self.old))
+        self.assertIsNone(details["observedParent"])
+        self.assertEqual(details["child"]["pid"], 11)
+        self.assertEqual(details["child"]["identityError"]["win32Error"], 87)
+        self.assertNotIn("CommandLine", details["child"])
+        self.assertEqual(runtime.invocations, [])
 
     def test_live_manager_or_missing_ack_cannot_arm(self):
         self.config["managerDisabledAcknowledged"] = False
@@ -482,14 +508,17 @@ class Tests(unittest.TestCase):
             self.arm(MockRuntime(self.config, [{10: desktop, 55: self.backend}]))
         self.assertFalse(Path(self.config["stateDir"]).exists())
 
-    def test_unknown_backend_orphan_after_parent_exit_is_ambiguous(self):
+    def test_readable_backend_orphan_after_parent_exit_is_retained(self):
         self.old_backend()
         child = process(56, 60, self.files["node.exe"], 55)
         orphan = process(57, 70, self.files["real-cli.exe"], 56)
         tracker = launch.backend_tracker(self.config)
         tracker.observe({55: self.backend, 56: child})
-        with self.assertRaisesRegex(launch.LaunchError, "unobserved_descendant_after_parent_exit"):
-            tracker.observe({55: self.backend, 57: orphan})
+        self.assertFalse(tracker.observe({55: self.backend, 57: orphan}))
+        restored = launch.backend_tracker(self.config, tracker.checkpoint())
+        self.assertEqual(restored.tracked[57], exact(orphan))
+        self.assertFalse(restored.observe({55: self.backend, 57: orphan}))
+        self.assertTrue(restored.observe({55: self.backend}))
 
     def test_backend_retirement_cutoff_survives_restore_and_later_reuse(self):
         self.old_backend()
@@ -506,9 +535,40 @@ class Tests(unittest.TestCase):
         self.assertNotIn(58, tracker.tracked)
         self.assertTrue(tracker.observe({55: self.backend, 56: {**replacement, "createdTicks": 300}, 58: newer_child}))
         self.assertEqual(tracker.retired_at[56], 200)
-        for ambiguous in (process(59, 100, self.files["real-cli.exe"], 56), {"pid": 59, "ppid": 56, "name": "unknown.exe"}):
-            with self.assertRaisesRegex(launch.LaunchError, "historical_backend_parentage_ambiguous"):
-                tracker.observe({55: self.backend, 59: ambiguous})
+        older_orphan = process(59, 100, self.files["real-cli.exe"], 56)
+        self.assertFalse(tracker.observe({55: self.backend, 59: older_orphan}))
+        self.assertEqual(tracker.tracked[59], exact(older_orphan))
+        self.assertEqual(tracker.retired_at[56], 200)
+        with self.assertRaisesRegex(launch.LaunchError, "historical_backend_parentage_ambiguous"):
+            tracker.observe({55: self.backend, 60: {"pid": 60, "ppid": 56, "name": "unknown.exe"}})
+
+    def test_retired_parent_cutoff_keeps_future_old_orphans_and_excludes_later_children(self):
+        self.old_backend()
+        parent = process(56, 60, self.files["node.exe"], 55)
+        tracker = launch.backend_tracker(self.config); tracker.observe({55: self.backend, 56: parent})
+        tracker.observe({55: self.backend, 56: process(56, 200, self.files["pythonw.exe"])})
+        tracker = launch.backend_tracker(self.config, tracker.checkpoint())
+        old_orphan = process(57, 150, self.files["node.exe"], 56)
+        later_child = process(58, 200, self.files["node.exe"], 56)
+        self.assertFalse(tracker.observe({55: self.backend, 57: old_orphan, 58: later_child}))
+        self.assertIn(57, tracker.tracked); self.assertNotIn(58, tracker.tracked)
+        self.assertTrue(tracker.observe({55: self.backend, 58: later_child}))
+        tracker = launch.backend_tracker(self.config, tracker.checkpoint())
+        another_old_orphan = process(59, 190, self.files["node.exe"], 56)
+        self.assertFalse(tracker.observe({55: self.backend, 59: another_old_orphan}))
+        self.assertEqual(tracker.retired_at[56], 200)
+
+    def test_orphan_pid_generation_collision_refuses_without_replacing_history(self):
+        self.old_backend()
+        child = process(56, 60, self.files["node.exe"], 55)
+        parent = process(57, 70, self.files["node.exe"], 55)
+        tracker = launch.backend_tracker(self.config); tracker.observe({55: self.backend, 56: child, 57: parent})
+        replacement = process(56, 90, self.files["real-cli.exe"], 57)
+        with self.assertRaisesRegex(launch.LaunchError, "replacement_is_new_old_tree_descendant") as caught:
+            tracker.observe({55: self.backend, 56: replacement})
+        self.assertEqual(tracker.tracked[56], exact(child))
+        self.assertEqual(caught.exception.details["parent"], exact(parent))
+        self.assertEqual(caught.exception.details["child"]["createdTicks"], 90)
 
     def test_backend_checkpoint_rejects_duplicate_root_retirement_and_unknown_cutoff(self):
         self.old_backend()

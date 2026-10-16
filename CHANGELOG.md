@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Conservatively retain readable children first observed after a tracked parent exits, and wait for their descendants to drain. Preserve historical PID reuse boundaries and refuse unreadable identities or conflicting process generations.
 - Recheck temporarily unreadable tracked Windows processes during normal shutdown before abandoning a restart. Preserve observed descendants across checks, refuse persistent ambiguity, and record the affected process and Windows error without retrying a launch.
 - Recognize desktop initialization that proceeds directly to subsequent requests without an `initialized` notification. Require successful desktop-owned responses before admitting gateway connections, and expose sanitized handshake progress for startup diagnosis.
 - Limit concurrent test files to avoid child-process startup contention causing unrelated protocol timeout failures on busy machines.

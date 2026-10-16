@@ -53,6 +53,14 @@ def identity_error(code, expected, observed):
         "observed": {key: observed[key] for key in fields if key in observed}})
 
 
+def parentage_error(code, parent, child, snapshot):
+    fields = ("pid", "ppid", "name", "path", "createdTicks", "identityError")
+    observed_parent = snapshot.get(parent["pid"])
+    return LaunchError(code, details={"parent": dict(parent),
+        "observedParent": None if observed_parent is None else {key: observed_parent[key] for key in fields if key in observed_parent},
+        "child": {key: child[key] for key in fields if key in child}})
+
+
 def observe_with_rechecks(runtime, observe, *, snapshot=None, sleep=time.sleep, clock=time.monotonic):
     """At most three observations, never a launch retry or an inferred process exit."""
     snapshot = runtime.snapshot() if snapshot is None else snapshot
@@ -260,24 +268,28 @@ class QuitTracker:
                 parent_id = process.get("ppid")
                 if parent_id not in self.tracked:
                     continue
-                if parent_id in self.retired:
-                    if self.retained_root and pid not in self.tracked:
-                        # A later PID incarnation cannot have produced an older
-                        # child. Preserve this cutoff even after it exits.
-                        if (not process.get("path") or type(process.get("createdTicks")) is not int
-                                or process["createdTicks"] < self.retired_at[parent_id]):
-                            fail("historical_backend_parentage_ambiguous")
-                    continue
-                if pid in self.tracked:
-                    if pid in self.retired and same(snapshot.get(parent_id), self.tracked[parent_id]):
-                        fail("replacement_is_new_old_tree_descendant")
-                    continue
                 parent = self.tracked[parent_id]
-                if not same(snapshot.get(parent["pid"]), parent):
-                    fail("unobserved_descendant_after_parent_exit")
+                if parent_id in self.retired:
+                    if pid not in self.tracked or pid in self.retired:
+                        if missing_identity(process):
+                            raise parentage_error("historical_backend_parentage_ambiguous", parent, process, snapshot)
+                        # Only a child born after proven reuse is unrelated to the
+                        # original parent. Retain older possible children below,
+                        # even after the replacement itself has disappeared.
+                        if process["createdTicks"] >= self.retired_at[parent_id]:
+                            continue
+                if pid in self.tracked:
+                    if pid in self.retired:
+                        # One PID cannot replace a historical identity with a new
+                        # possibly owned generation in this checkpoint format.
+                        raise parentage_error("replacement_is_new_old_tree_descendant", parent, process, snapshot)
+                    continue
                 if (not process.get("path") or type(process.get("createdTicks")) is not int
                         or process["createdTicks"] < parent["createdTicks"]):
-                    fail("descendant_identity_ambiguous")
+                    raise parentage_error("descendant_identity_ambiguous", parent, process, snapshot)
+                # Enumeration can first see a child after its parent exits. Its
+                # ancestry is uncertain, so conservatively retain the readable
+                # exact instance and its descendants until they naturally drain.
                 self.tracked[pid] = {key: process[key] for key in ("pid", "createdTicks", "path")}
                 changed = True
         if not self.retained_root:
@@ -287,8 +299,8 @@ class QuitTracker:
                     fail("another_desktop_observed")
         self.remaining = sum(pid in snapshot and pid not in self.retired
                              and not (self.retained_root and pid == self.old["pid"]) for pid in self.tracked)
-        # Keep every safely observed descendant/retirement before resampling. A new
-        # ambiguous/orphan descendant above fails immediately, even during a recheck.
+        # Keep every readable possibly owned descendant/retirement before
+        # resampling. An unreadable new identity still refuses immediately.
         if unavailable:
             raise unavailable
         return self.remaining == 0
